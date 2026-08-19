@@ -18,7 +18,6 @@ st.set_page_config(
 
 # =========================================================
 # DEMO USERS
-# Prototype only - do NOT use real passwords
 # =========================================================
 
 USERS = {
@@ -46,7 +45,7 @@ USERS = {
 
 
 # =========================================================
-# DEMO G/L MASTER
+# G/L MASTER
 # =========================================================
 
 GL_MASTER = {
@@ -239,11 +238,9 @@ def generate_jv_number(accounting_period):
 
     if row is None:
         sequence = 1
-
     else:
         last_number = row[0]
-        last_sequence = int(last_number[-2:])
-        sequence = last_sequence + 1
+        sequence = int(last_number[-2:]) + 1
 
     return f"JV{period}{sequence:02d}"
 
@@ -272,9 +269,7 @@ def save_jv(
     conn = get_connection()
     cursor = conn.cursor()
 
-    now = datetime.now().strftime(
-        "%Y-%m-%d %H:%M:%S"
-    )
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     cursor.execute("""
         INSERT INTO jv_headers (
@@ -308,7 +303,6 @@ def save_jv(
     ))
 
     jv_id = cursor.lastrowid
-
     line_no = 1
 
     for _, row in journal_df.iterrows():
@@ -364,13 +358,8 @@ def save_jv(
 
         line_date = row["Date"]
 
-        if hasattr(
-            line_date,
-            "strftime"
-        ):
-            line_date = line_date.strftime(
-                "%Y-%m-%d"
-            )
+        if hasattr(line_date, "strftime"):
+            line_date = line_date.strftime("%Y-%m-%d")
 
         cursor.execute("""
             INSERT INTO jv_lines (
@@ -435,24 +424,195 @@ def get_jv_lines(jv_id):
     return df
 
 
+def get_jv_header(jv_id):
+
+    conn = get_connection()
+
+    row = conn.execute("""
+        SELECT
+            id,
+            jv_number,
+            jv_type,
+            accounting_period,
+            remarks,
+            status,
+            total_debit,
+            total_credit,
+            prepared_by,
+            prepared_name,
+            submitted_at,
+            approved_by,
+            approved_name,
+            approved_at,
+            reviewer_comments,
+            posted_by,
+            posted_at,
+            attachment_names
+        FROM jv_headers
+        WHERE id = ?
+    """, (jv_id,)).fetchone()
+
+    conn.close()
+
+    return row
+
+
+def month_label(period_text):
+
+    if not period_text:
+        return ""
+
+    dt = datetime.strptime(
+        period_text,
+        "%Y-%m"
+    )
+
+    return dt.strftime("%B %Y")
+
+
+def show_jv_detail(jv_id):
+
+    header = get_jv_header(jv_id)
+
+    if not header:
+        st.error("JV not found.")
+        return
+
+    (
+        _,
+        jv_number,
+        jv_type,
+        accounting_period,
+        remarks,
+        status,
+        total_debit,
+        total_credit,
+        prepared_by,
+        prepared_name,
+        submitted_at,
+        approved_by,
+        approved_name,
+        approved_at,
+        reviewer_comments,
+        posted_by,
+        posted_at,
+        attachment_names
+    ) = header
+
+    st.subheader(jv_number)
+
+    c1, c2, c3, c4 = st.columns(4)
+
+    c1.write(f"**Month**  \n{month_label(accounting_period)}")
+    c2.write(f"**JV Type**  \n{jv_type}")
+    c3.write(f"**Status**  \n{status}")
+    c4.write(f"**Amount**  \nRM {total_debit:,.2f}")
+
+    if remarks:
+        st.write(f"**Description:** {remarks}")
+
+    line_df = get_jv_lines(jv_id)
+
+    st.dataframe(
+        line_df,
+        use_container_width=True,
+        hide_index=True
+    )
+
+    c1, c2 = st.columns(2)
+
+    c1.metric(
+        "Total Dr",
+        f"RM {total_debit:,.2f}"
+    )
+
+    c2.metric(
+        "Total Cr",
+        f"RM {total_credit:,.2f}"
+    )
+
+    st.divider()
+
+    st.write(
+        f"**Prepared by:** "
+        f"{prepared_name} ({prepared_by})"
+    )
+
+    st.write(
+        f"**Submitted:** "
+        f"{submitted_at or '-'}"
+    )
+
+    if approved_name:
+
+        st.write(
+            f"**Approved by:** "
+            f"{approved_name} ({approved_by})"
+        )
+
+        st.write(
+            f"**Approval date:** "
+            f"{approved_at or '-'}"
+        )
+
+    if reviewer_comments:
+
+        st.write(
+            f"**Reviewer comments:** "
+            f"{reviewer_comments}"
+        )
+
+    if posted_by:
+
+        st.write(
+            f"**Posted by:** "
+            f"{posted_by}"
+        )
+
+        st.write(
+            f"**Posted date:** "
+            f"{posted_at or '-'}"
+        )
+
+    try:
+        attachments = json.loads(
+            attachment_names or "[]"
+        )
+    except:
+        attachments = []
+
+    if attachments:
+
+        st.write(
+            "**Attachments:** "
+            + ", ".join(attachments)
+        )
+    else:
+
+        st.caption(
+            "No supporting documents attached."
+        )
+
+
 # =========================================================
-# SESSION
+# SESSION STATE
 # =========================================================
 
-if "logged_in" not in st.session_state:
-    st.session_state.logged_in = False
+defaults = {
+    "logged_in": False,
+    "employee_no": None,
+    "user_name": None,
+    "role": None,
+    "page": "Dashboard",
+    "dashboard_status": None,
+    "dashboard_month": None,
+    "dashboard_jv_id": None
+}
 
-if "employee_no" not in st.session_state:
-    st.session_state.employee_no = None
+for key, value in defaults.items():
 
-if "user_name" not in st.session_state:
-    st.session_state.user_name = None
-
-if "role" not in st.session_state:
-    st.session_state.role = None
-
-if "page" not in st.session_state:
-    st.session_state.page = "Dashboard"
+    if key not in st.session_state:
+        st.session_state[key] = value
 
 
 # =========================================================
@@ -485,6 +645,9 @@ def logout():
     st.session_state.user_name = None
     st.session_state.role = None
     st.session_state.page = "Dashboard"
+    st.session_state.dashboard_status = None
+    st.session_state.dashboard_month = None
+    st.session_state.dashboard_jv_id = None
 
     st.rerun()
 
@@ -521,11 +684,9 @@ if not st.session_state.logged_in:
             employee_no,
             password
         ):
-
             st.rerun()
 
         else:
-
             st.error(
                 "Invalid Employee Number or Password."
             )
@@ -607,18 +768,21 @@ with st.sidebar:
         menu_options
     )
 
-    st.session_state.page = selected_page
+    if selected_page != st.session_state.page:
+
+        st.session_state.page = selected_page
+        st.session_state.dashboard_status = None
+        st.session_state.dashboard_month = None
+        st.session_state.dashboard_jv_id = None
 
     st.divider()
 
-    if st.button(
-        "Logout"
-    ):
+    if st.button("Logout"):
         logout()
 
 
 # =========================================================
-# MAIN HEADER
+# HEADER
 # =========================================================
 
 st.title(
@@ -644,63 +808,101 @@ if st.session_state.page == "Dashboard":
 
     conn = get_connection()
 
+
+    # -----------------------------------------------------
+    # PREPARER DASHBOARD
+    # -----------------------------------------------------
+
     if role == "PREPARER":
 
-        draft_count = conn.execute("""
-            SELECT COUNT(*)
-            FROM jv_headers
-            WHERE prepared_by = ?
-            AND status = 'DRAFT'
-        """, (employee_no,)).fetchone()[0]
+        status_groups = {
+            "DRAFT": [
+                "DRAFT"
+            ],
+            "PENDING": [
+                "PENDING APPROVAL",
+                "RESUBMITTED"
+            ],
+            "AMENDMENT": [
+                "AMENDMENT REQUIRED"
+            ],
+            "APPROVED": [
+                "APPROVED",
+                "POSTED TO UBS"
+            ]
+        }
 
-        pending_count = conn.execute("""
-            SELECT COUNT(*)
-            FROM jv_headers
-            WHERE prepared_by = ?
-            AND status IN (
-                'PENDING APPROVAL',
-                'RESUBMITTED'
+        counts = {}
+
+        for label, statuses in status_groups.items():
+
+            placeholders = ",".join(
+                "?"
+                for _ in statuses
             )
-        """, (employee_no,)).fetchone()[0]
 
-        amendment_count = conn.execute("""
-            SELECT COUNT(*)
-            FROM jv_headers
-            WHERE prepared_by = ?
-            AND status = 'AMENDMENT REQUIRED'
-        """, (employee_no,)).fetchone()[0]
+            query = f"""
+                SELECT COUNT(*)
+                FROM jv_headers
+                WHERE prepared_by = ?
+                AND status IN ({placeholders})
+            """
 
-        approved_count = conn.execute("""
-            SELECT COUNT(*)
-            FROM jv_headers
-            WHERE prepared_by = ?
-            AND status IN (
-                'APPROVED',
-                'POSTED TO UBS'
-            )
-        """, (employee_no,)).fetchone()[0]
+            params = [
+                employee_no
+            ] + statuses
+
+            counts[label] = conn.execute(
+                query,
+                params
+            ).fetchone()[0]
 
         c1, c2, c3, c4 = st.columns(4)
 
-        c1.metric(
-            "Draft",
-            draft_count
-        )
+        with c1:
+            if st.button(
+                f"Draft\n\n{counts['DRAFT']}",
+                use_container_width=True
+            ):
+                st.session_state.dashboard_status = "DRAFT"
+                st.session_state.dashboard_month = None
+                st.session_state.dashboard_jv_id = None
+                st.rerun()
 
-        c2.metric(
-            "Pending",
-            pending_count
-        )
+        with c2:
+            if st.button(
+                f"Pending Approval\n\n{counts['PENDING']}",
+                use_container_width=True
+            ):
+                st.session_state.dashboard_status = "PENDING"
+                st.session_state.dashboard_month = None
+                st.session_state.dashboard_jv_id = None
+                st.rerun()
 
-        c3.metric(
-            "Amendment",
-            amendment_count
-        )
+        with c3:
+            if st.button(
+                f"Amendment Required\n\n{counts['AMENDMENT']}",
+                use_container_width=True
+            ):
+                st.session_state.dashboard_status = "AMENDMENT"
+                st.session_state.dashboard_month = None
+                st.session_state.dashboard_jv_id = None
+                st.rerun()
 
-        c4.metric(
-            "Approved",
-            approved_count
-        )
+        with c4:
+            if st.button(
+                f"Approved\n\n{counts['APPROVED']}",
+                use_container_width=True
+            ):
+                st.session_state.dashboard_status = "APPROVED"
+                st.session_state.dashboard_month = None
+                st.session_state.dashboard_jv_id = None
+                st.rerun()
+
+
+    # -----------------------------------------------------
+    # APPROVER DASHBOARD
+    # -----------------------------------------------------
 
     elif role == "APPROVER":
 
@@ -721,19 +923,61 @@ if st.session_state.page == "Dashboard":
                 'APPROVED',
                 'POSTED TO UBS'
             )
-        """, (employee_no,)).fetchone()[0]
+        """, (
+            employee_no,
+        )).fetchone()[0]
 
-        c1, c2 = st.columns(2)
+        returned_count = conn.execute("""
+            SELECT COUNT(*)
+            FROM audit_log
+            WHERE employee_no = ?
+            AND event_type = 'JV_RETURNED'
+        """, (
+            employee_no,
+        )).fetchone()[0]
 
-        c1.metric(
-            "Pending Approval",
-            pending_count
-        )
+        c1, c2, c3 = st.columns(3)
 
-        c2.metric(
-            "Approved",
-            approved_count
-        )
+        with c1:
+
+            if st.button(
+                f"Pending Approval\n\n{pending_count}",
+                use_container_width=True
+            ):
+
+                st.session_state.dashboard_status = "PENDING"
+                st.session_state.dashboard_month = None
+                st.session_state.dashboard_jv_id = None
+                st.rerun()
+
+        with c2:
+
+            if st.button(
+                f"Approved\n\n{approved_count}",
+                use_container_width=True
+            ):
+
+                st.session_state.dashboard_status = "APPROVED"
+                st.session_state.dashboard_month = None
+                st.session_state.dashboard_jv_id = None
+                st.rerun()
+
+        with c3:
+
+            if st.button(
+                f"Returned\n\n{returned_count}",
+                use_container_width=True
+            ):
+
+                st.session_state.dashboard_status = "RETURNED"
+                st.session_state.dashboard_month = None
+                st.session_state.dashboard_jv_id = None
+                st.rerun()
+
+
+    # -----------------------------------------------------
+    # AUDITOR DASHBOARD
+    # -----------------------------------------------------
 
     elif role == "AUDITOR":
 
@@ -742,22 +986,72 @@ if st.session_state.page == "Dashboard":
             FROM jv_headers
         """).fetchone()[0]
 
+        approved_count = conn.execute("""
+            SELECT COUNT(*)
+            FROM jv_headers
+            WHERE status = 'APPROVED'
+        """).fetchone()[0]
+
+        posted_count = conn.execute("""
+            SELECT COUNT(*)
+            FROM jv_headers
+            WHERE status = 'POSTED TO UBS'
+        """).fetchone()[0]
+
         audit_count = conn.execute("""
             SELECT COUNT(*)
             FROM audit_log
         """).fetchone()[0]
 
-        c1, c2 = st.columns(2)
+        c1, c2, c3, c4 = st.columns(4)
 
-        c1.metric(
-            "JV Records",
-            total_count
-        )
+        with c1:
 
-        c2.metric(
-            "Audit Records",
-            audit_count
-        )
+            if st.button(
+                f"All JV Records\n\n{total_count}",
+                use_container_width=True
+            ):
+
+                st.session_state.dashboard_status = "ALL"
+                st.session_state.dashboard_month = None
+                st.session_state.dashboard_jv_id = None
+                st.rerun()
+
+        with c2:
+
+            if st.button(
+                f"Approved\n\n{approved_count}",
+                use_container_width=True
+            ):
+
+                st.session_state.dashboard_status = "APPROVED"
+                st.session_state.dashboard_month = None
+                st.session_state.dashboard_jv_id = None
+                st.rerun()
+
+        with c3:
+
+            if st.button(
+                f"Posted to UBS\n\n{posted_count}",
+                use_container_width=True
+            ):
+
+                st.session_state.dashboard_status = "POSTED"
+                st.session_state.dashboard_month = None
+                st.session_state.dashboard_jv_id = None
+                st.rerun()
+
+        with c4:
+
+            st.metric(
+                "Audit Records",
+                audit_count
+            )
+
+
+    # -----------------------------------------------------
+    # ADMIN DASHBOARD
+    # -----------------------------------------------------
 
     elif role == "ADMIN":
 
@@ -786,8 +1080,429 @@ if st.session_state.page == "Dashboard":
     conn.close()
 
 
+    # =====================================================
+    # DASHBOARD DRILL-DOWN
+    # =====================================================
+
+    selected_status = st.session_state.dashboard_status
+
+
+    if selected_status:
+
+        st.divider()
+
+        if st.button(
+            "← Back to Dashboard"
+        ):
+
+            st.session_state.dashboard_status = None
+            st.session_state.dashboard_month = None
+            st.session_state.dashboard_jv_id = None
+            st.rerun()
+
+
+        # -------------------------------------------------
+        # LEVEL 3 - JV DETAIL
+        # -------------------------------------------------
+
+        if st.session_state.dashboard_jv_id:
+
+            show_jv_detail(
+                st.session_state.dashboard_jv_id
+            )
+
+
+        # -------------------------------------------------
+        # LEVEL 2 - JV LIST FOR MONTH
+        # -------------------------------------------------
+
+        elif st.session_state.dashboard_month:
+
+            selected_month = (
+                st.session_state.dashboard_month
+            )
+
+            st.subheader(
+                month_label(selected_month)
+            )
+
+            if st.button(
+                "← Back to Months"
+            ):
+
+                st.session_state.dashboard_month = None
+                st.session_state.dashboard_jv_id = None
+                st.rerun()
+
+            conn = get_connection()
+
+            query = """
+                SELECT
+                    id,
+                    jv_number,
+                    jv_type,
+                    total_debit,
+                    status,
+                    prepared_name,
+                    approved_name
+                FROM jv_headers
+                WHERE accounting_period = ?
+            """
+
+            params = [
+                selected_month
+            ]
+
+
+            if role == "PREPARER":
+
+                query += """
+                    AND prepared_by = ?
+                """
+
+                params.append(
+                    employee_no
+                )
+
+
+                if selected_status == "DRAFT":
+
+                    query += """
+                        AND status = 'DRAFT'
+                    """
+
+
+                elif selected_status == "PENDING":
+
+                    query += """
+                        AND status IN (
+                            'PENDING APPROVAL',
+                            'RESUBMITTED'
+                        )
+                    """
+
+
+                elif selected_status == "AMENDMENT":
+
+                    query += """
+                        AND status = 'AMENDMENT REQUIRED'
+                    """
+
+
+                elif selected_status == "APPROVED":
+
+                    query += """
+                        AND status IN (
+                            'APPROVED',
+                            'POSTED TO UBS'
+                        )
+                    """
+
+
+            elif role == "APPROVER":
+
+                if selected_status == "PENDING":
+
+                    query += """
+                        AND status IN (
+                            'PENDING APPROVAL',
+                            'RESUBMITTED'
+                        )
+                    """
+
+
+                elif selected_status == "APPROVED":
+
+                    query += """
+                        AND approved_by = ?
+                        AND status IN (
+                            'APPROVED',
+                            'POSTED TO UBS'
+                        )
+                    """
+
+                    params.append(
+                        employee_no
+                    )
+
+
+                elif selected_status == "RETURNED":
+
+                    query += """
+                        AND id IN (
+                            SELECT jv_id
+                            FROM audit_log
+                            WHERE employee_no = ?
+                            AND event_type = 'JV_RETURNED'
+                        )
+                    """
+
+                    params.append(
+                        employee_no
+                    )
+
+
+            elif role == "AUDITOR":
+
+                if selected_status == "APPROVED":
+
+                    query += """
+                        AND status = 'APPROVED'
+                    """
+
+
+                elif selected_status == "POSTED":
+
+                    query += """
+                        AND status = 'POSTED TO UBS'
+                    """
+
+
+            query += """
+                ORDER BY id DESC
+            """
+
+            result = conn.execute(
+                query,
+                params
+            ).fetchall()
+
+            conn.close()
+
+
+            if not result:
+
+                st.info(
+                    "No JV records for this month."
+                )
+
+
+            else:
+
+                for row in result:
+
+                    (
+                        jv_id,
+                        jv_number,
+                        jv_type,
+                        amount,
+                        status,
+                        preparer,
+                        approver
+                    ) = row
+
+                    c1, c2, c3, c4 = st.columns(
+                        [2, 2, 2, 1]
+                    )
+
+                    c1.write(
+                        f"**{jv_number}**"
+                    )
+
+                    c2.write(
+                        jv_type
+                    )
+
+                    c3.write(
+                        f"RM {amount:,.2f}"
+                    )
+
+                    with c4:
+
+                        if st.button(
+                            "Open",
+                            key=f"open_{jv_id}"
+                        ):
+
+                            st.session_state.dashboard_jv_id = jv_id
+                            st.rerun()
+
+                    st.caption(
+                        f"{status} | "
+                        f"Preparer: {preparer}"
+                    )
+
+                    st.divider()
+
+
+        # -------------------------------------------------
+        # LEVEL 1 - MONTH SUMMARY
+        # -------------------------------------------------
+
+        else:
+
+            st.subheader(
+                "Select Accounting Month"
+            )
+
+            conn = get_connection()
+
+            query = """
+                SELECT
+                    accounting_period,
+                    COUNT(*) AS total
+                FROM jv_headers
+                WHERE 1 = 1
+            """
+
+            params = []
+
+
+            if role == "PREPARER":
+
+                query += """
+                    AND prepared_by = ?
+                """
+
+                params.append(
+                    employee_no
+                )
+
+
+                if selected_status == "DRAFT":
+
+                    query += """
+                        AND status = 'DRAFT'
+                    """
+
+
+                elif selected_status == "PENDING":
+
+                    query += """
+                        AND status IN (
+                            'PENDING APPROVAL',
+                            'RESUBMITTED'
+                        )
+                    """
+
+
+                elif selected_status == "AMENDMENT":
+
+                    query += """
+                        AND status = 'AMENDMENT REQUIRED'
+                    """
+
+
+                elif selected_status == "APPROVED":
+
+                    query += """
+                        AND status IN (
+                            'APPROVED',
+                            'POSTED TO UBS'
+                        )
+                    """
+
+
+            elif role == "APPROVER":
+
+                if selected_status == "PENDING":
+
+                    query += """
+                        AND status IN (
+                            'PENDING APPROVAL',
+                            'RESUBMITTED'
+                        )
+                    """
+
+
+                elif selected_status == "APPROVED":
+
+                    query += """
+                        AND approved_by = ?
+                        AND status IN (
+                            'APPROVED',
+                            'POSTED TO UBS'
+                        )
+                    """
+
+                    params.append(
+                        employee_no
+                    )
+
+
+                elif selected_status == "RETURNED":
+
+                    query += """
+                        AND id IN (
+                            SELECT jv_id
+                            FROM audit_log
+                            WHERE employee_no = ?
+                            AND event_type = 'JV_RETURNED'
+                        )
+                    """
+
+                    params.append(
+                        employee_no
+                    )
+
+
+            elif role == "AUDITOR":
+
+                if selected_status == "APPROVED":
+
+                    query += """
+                        AND status = 'APPROVED'
+                    """
+
+
+                elif selected_status == "POSTED":
+
+                    query += """
+                        AND status = 'POSTED TO UBS'
+                    """
+
+
+            query += """
+                GROUP BY accounting_period
+                ORDER BY accounting_period DESC
+            """
+
+            month_rows = conn.execute(
+                query,
+                params
+            ).fetchall()
+
+            conn.close()
+
+
+            if not month_rows:
+
+                st.info(
+                    "No JV records found."
+                )
+
+
+            else:
+
+                for accounting_period, total in month_rows:
+
+                    c1, c2 = st.columns(
+                        [4, 1]
+                    )
+
+                    c1.write(
+                        f"### {month_label(accounting_period)}"
+                    )
+
+                    with c2:
+
+                        if st.button(
+                            f"{total} JV",
+                            key=f"month_{accounting_period}"
+                        ):
+
+                            st.session_state.dashboard_month = (
+                                accounting_period
+                            )
+
+                            st.session_state.dashboard_jv_id = None
+                            st.rerun()
+
+                    st.divider()
+
+
 # =========================================================
-# CREATE JV
+# CREATE NEW JV
 # =========================================================
 
 elif st.session_state.page == "Create New JV":
@@ -849,10 +1564,6 @@ elif st.session_state.page == "Create New JV":
                 "Other"
             ]
         )
-
-    with c2:
-
-        st.write("")
 
     remarks = st.text_input(
         "JV Description / Remarks"
@@ -1042,8 +1753,7 @@ elif st.session_state.page == "Create New JV":
         if debit > 0 and credit > 0:
 
             errors.append(
-                f"Line {line_no}: "
-                "Enter Dr or Cr only."
+                f"Line {line_no}: Enter Dr or Cr only."
             )
 
         if debit == 0 and credit == 0:
@@ -1077,7 +1787,6 @@ elif st.session_state.page == "Create New JV":
         ):
 
             for error in errors:
-
                 st.write(
                     f"• {error}"
                 )
@@ -1117,7 +1826,7 @@ elif st.session_state.page == "Create New JV":
         )
 
         st.info(
-            "It is now available in the Approver's Approval Inbox."
+            "Available in Approver's Approval Inbox."
         )
 
 
@@ -1141,30 +1850,58 @@ elif st.session_state.page == "My JVs":
 
     conn = get_connection()
 
-    my_jvs = pd.read_sql_query("""
+    month_rows = conn.execute("""
         SELECT
-            id,
-            jv_number AS "JV No.",
-            jv_type AS "JV Type",
-            accounting_period AS "Period",
-            total_debit AS "Amount",
-            status AS "Status",
-            submitted_at AS "Submitted",
-            reviewer_comments AS "Reviewer Comments"
+            accounting_period,
+            COUNT(*)
         FROM jv_headers
         WHERE prepared_by = ?
-        ORDER BY id DESC
-    """, conn, params=(employee_no,))
+        GROUP BY accounting_period
+        ORDER BY accounting_period DESC
+    """, (
+        employee_no,
+    )).fetchall()
 
     conn.close()
 
-    if my_jvs.empty:
+    if not month_rows:
 
         st.info(
-            "No JVs found."
+            "No JV records."
         )
 
     else:
+
+        selected_month = st.selectbox(
+            "Accounting Month",
+            [
+                period
+                for period, _
+                in month_rows
+            ],
+            format_func=month_label
+        )
+
+        conn = get_connection()
+
+        my_jvs = pd.read_sql_query("""
+            SELECT
+                id,
+                jv_number AS "JV No.",
+                jv_type AS "JV Type",
+                total_debit AS "Amount",
+                status AS "Status",
+                reviewer_comments AS "Reviewer Comments"
+            FROM jv_headers
+            WHERE prepared_by = ?
+            AND accounting_period = ?
+            ORDER BY id DESC
+        """, conn, params=(
+            employee_no,
+            selected_month
+        ))
+
+        conn.close()
 
         st.dataframe(
             my_jvs.drop(
@@ -1174,75 +1911,23 @@ elif st.session_state.page == "My JVs":
             hide_index=True
         )
 
-        approved_jvs = my_jvs[
-            my_jvs["Status"] == "APPROVED"
-        ]
+        if not my_jvs.empty:
 
-        if not approved_jvs.empty:
-
-            st.subheader(
-                "UBS Posting"
+            selected_jv = st.selectbox(
+                "Open JV",
+                my_jvs["JV No."].tolist()
             )
 
-            selected_post_jv = st.selectbox(
-                "Select Approved JV",
-                approved_jvs["JV No."].tolist()
+            selected_id = int(
+                my_jvs[
+                    my_jvs["JV No."]
+                    == selected_jv
+                ]["id"].iloc[0]
             )
 
-            if st.button(
-                "Mark as Posted to UBS"
-            ):
-
-                conn = get_connection()
-
-                row = conn.execute("""
-                    SELECT id
-                    FROM jv_headers
-                    WHERE jv_number = ?
-                    AND prepared_by = ?
-                """, (
-                    selected_post_jv,
-                    employee_no
-                )).fetchone()
-
-                if row:
-
-                    jv_id = row[0]
-
-                    conn.execute("""
-                        UPDATE jv_headers
-                        SET
-                            status = 'POSTED TO UBS',
-                            posted_by = ?,
-                            posted_at = ?
-                        WHERE id = ?
-                    """, (
-                        employee_no,
-                        datetime.now().strftime(
-                            "%Y-%m-%d %H:%M:%S"
-                        ),
-                        jv_id
-                    ))
-
-                    conn.commit()
-
-                    add_audit_log(
-                        jv_id,
-                        selected_post_jv,
-                        "JV_POSTED_TO_UBS",
-                        employee_no,
-                        user_name,
-                        role,
-                        "Marked as posted to UBS."
-                    )
-
-                    st.success(
-                        f"{selected_post_jv} marked as Posted to UBS."
-                    )
-
-                    st.rerun()
-
-                conn.close()
+            show_jv_detail(
+                selected_id
+            )
 
 
 # =========================================================
@@ -1265,34 +1950,64 @@ elif st.session_state.page == "Approval Inbox":
 
     conn = get_connection()
 
-    pending_df = pd.read_sql_query("""
+    month_rows = conn.execute("""
         SELECT
-            id,
-            jv_number AS "JV No.",
-            jv_type AS "JV Type",
-            accounting_period AS "Period",
-            remarks AS "Description",
-            total_debit AS "Amount",
-            prepared_name AS "Preparer",
-            submitted_at AS "Submitted",
-            status AS "Status"
+            accounting_period,
+            COUNT(*)
         FROM jv_headers
         WHERE status IN (
             'PENDING APPROVAL',
             'RESUBMITTED'
         )
-        ORDER BY id DESC
-    """, conn)
+        GROUP BY accounting_period
+        ORDER BY accounting_period DESC
+    """).fetchall()
 
     conn.close()
 
-    if pending_df.empty:
+    if not month_rows:
 
         st.info(
             "No JVs awaiting approval."
         )
 
     else:
+
+        selected_month = st.selectbox(
+            "Accounting Month",
+            [
+                period
+                for period, _
+                in month_rows
+            ],
+            format_func=lambda x:
+                f"{month_label(x)}"
+        )
+
+        conn = get_connection()
+
+        pending_df = pd.read_sql_query("""
+            SELECT
+                id,
+                jv_number AS "JV No.",
+                jv_type AS "JV Type",
+                remarks AS "Description",
+                total_debit AS "Amount",
+                prepared_name AS "Preparer",
+                submitted_at AS "Submitted",
+                status AS "Status"
+            FROM jv_headers
+            WHERE status IN (
+                'PENDING APPROVAL',
+                'RESUBMITTED'
+            )
+            AND accounting_period = ?
+            ORDER BY id DESC
+        """, conn, params=(
+            selected_month,
+        ))
+
+        conn.close()
 
         st.dataframe(
             pending_df.drop(
@@ -1318,35 +2033,8 @@ elif st.session_state.page == "Approval Inbox":
 
         st.divider()
 
-        st.subheader(
-            selected_jv_number
-        )
-
-        c1, c2, c3 = st.columns(3)
-
-        c1.write(
-            f"**Type:** "
-            f"{selected_row['JV Type']}"
-        )
-
-        c2.write(
-            f"**Preparer:** "
-            f"{selected_row['Preparer']}"
-        )
-
-        c3.write(
-            f"**Amount:** "
-            f"RM {selected_row['Amount']:,.2f}"
-        )
-
-        line_df = get_jv_lines(
+        show_jv_detail(
             selected_jv_id
-        )
-
-        st.dataframe(
-            line_df,
-            use_container_width=True,
-            hide_index=True
         )
 
         comments = st.text_area(
@@ -1380,17 +2068,15 @@ elif st.session_state.page == "Approval Inbox":
                         selected_jv_id,
                     )).fetchone()
 
-                    if preparer:
+                    if preparer and preparer[0] == employee_no:
 
-                        if preparer[0] == employee_no:
+                        conn.close()
 
-                            st.error(
-                                "Segregation of duties violation: "
-                                "preparer cannot review own JV."
-                            )
+                        st.error(
+                            "Segregation of duties violation."
+                        )
 
-                            conn.close()
-                            st.stop()
+                        st.stop()
 
                     conn.execute("""
                         UPDATE jv_headers
@@ -1420,7 +2106,7 @@ elif st.session_state.page == "Approval Inbox":
                     )
 
                     st.success(
-                        f"{selected_jv_number} returned for amendment."
+                        f"{selected_jv_number} returned."
                     )
 
                     st.rerun()
@@ -1443,17 +2129,15 @@ elif st.session_state.page == "Approval Inbox":
                     selected_jv_id,
                 )).fetchone()
 
-                if preparer:
+                if preparer and preparer[0] == employee_no:
 
-                    if preparer[0] == employee_no:
+                    conn.close()
 
-                        st.error(
-                            "Segregation of duties violation: "
-                            "preparer cannot approve own JV."
-                        )
+                    st.error(
+                        "Segregation of duties violation."
+                    )
 
-                        conn.close()
-                        st.stop()
+                    st.stop()
 
                 now = datetime.now().strftime(
                     "%Y-%m-%d %H:%M:%S"
@@ -1517,84 +2201,136 @@ elif st.session_state.page == "Search JVs":
         "Search JVs"
     )
 
-    c1, c2 = st.columns(2)
-
-    with c1:
-
-        search_jv = st.text_input(
-            "JV Number"
-        )
-
-    with c2:
-
-        search_status = st.selectbox(
-            "Status",
-            [
-                "All",
-                "PENDING APPROVAL",
-                "AMENDMENT REQUIRED",
-                "RESUBMITTED",
-                "APPROVED",
-                "POSTED TO UBS",
-                "CANCELLED"
-            ]
-        )
-
     conn = get_connection()
 
-    query = """
-        SELECT
-            jv_number AS "JV No.",
-            jv_type AS "JV Type",
-            accounting_period AS "Period",
-            total_debit AS "Amount",
-            prepared_name AS "Preparer",
-            approved_name AS "Approver",
-            approved_at AS "Approval Date",
-            status AS "Status"
+    month_rows = conn.execute("""
+        SELECT DISTINCT
+            accounting_period
         FROM jv_headers
-        WHERE 1 = 1
-    """
-
-    params = []
-
-    if search_jv:
-
-        query += """
-            AND jv_number LIKE ?
-        """
-
-        params.append(
-            f"%{search_jv}%"
-        )
-
-    if search_status != "All":
-
-        query += """
-            AND status = ?
-        """
-
-        params.append(
-            search_status
-        )
-
-    query += """
-        ORDER BY id DESC
-    """
-
-    result = pd.read_sql_query(
-        query,
-        conn,
-        params=params
-    )
+        ORDER BY accounting_period DESC
+    """).fetchall()
 
     conn.close()
 
-    st.dataframe(
-        result,
-        use_container_width=True,
-        hide_index=True
-    )
+    months = [
+        row[0]
+        for row in month_rows
+    ]
+
+    if not months:
+
+        st.info(
+            "No JV records."
+        )
+
+    else:
+
+        selected_month = st.selectbox(
+            "Accounting Month",
+            months,
+            format_func=month_label
+        )
+
+        c1, c2 = st.columns(2)
+
+        with c1:
+
+            search_jv = st.text_input(
+                "JV Number"
+            )
+
+        with c2:
+
+            search_status = st.selectbox(
+                "Status",
+                [
+                    "All",
+                    "PENDING APPROVAL",
+                    "AMENDMENT REQUIRED",
+                    "RESUBMITTED",
+                    "APPROVED",
+                    "POSTED TO UBS",
+                    "CANCELLED"
+                ]
+            )
+
+        conn = get_connection()
+
+        query = """
+            SELECT
+                id,
+                jv_number AS "JV No.",
+                jv_type AS "JV Type",
+                total_debit AS "Amount",
+                prepared_name AS "Preparer",
+                approved_name AS "Approver",
+                approved_at AS "Approval Date",
+                status AS "Status"
+            FROM jv_headers
+            WHERE accounting_period = ?
+        """
+
+        params = [
+            selected_month
+        ]
+
+        if search_jv:
+
+            query += """
+                AND jv_number LIKE ?
+            """
+
+            params.append(
+                f"%{search_jv}%"
+            )
+
+        if search_status != "All":
+
+            query += """
+                AND status = ?
+            """
+
+            params.append(
+                search_status
+            )
+
+        query += """
+            ORDER BY id DESC
+        """
+
+        result = pd.read_sql_query(
+            query,
+            conn,
+            params=params
+        )
+
+        conn.close()
+
+        st.dataframe(
+            result.drop(
+                columns=["id"]
+            ),
+            use_container_width=True,
+            hide_index=True
+        )
+
+        if not result.empty:
+
+            selected_jv = st.selectbox(
+                "Open JV",
+                result["JV No."].tolist()
+            )
+
+            selected_id = int(
+                result[
+                    result["JV No."]
+                    == selected_jv
+                ]["id"].iloc[0]
+            )
+
+            show_jv_detail(
+                selected_id
+            )
 
 
 # =========================================================
@@ -1714,7 +2450,7 @@ elif st.session_state.page == "New PIC Request":
 
 
 # =========================================================
-# ADMIN - USER MANAGEMENT
+# ADMIN
 # =========================================================
 
 elif st.session_state.page == "User Management":
@@ -1765,10 +2501,6 @@ elif st.session_state.page == "User Management":
     )
 
 
-# =========================================================
-# ADMIN - G/L MASTER
-# =========================================================
-
 elif st.session_state.page == "G/L Master":
 
     if role != "ADMIN":
@@ -1800,10 +2532,6 @@ elif st.session_state.page == "G/L Master":
         hide_index=True
     )
 
-
-# =========================================================
-# ADMIN - JV TYPES
-# =========================================================
 
 elif st.session_state.page == "JV Type Master":
 
@@ -1856,10 +2584,6 @@ elif st.session_state.page == "JV Type Master":
         hide_index=True
     )
 
-
-# =========================================================
-# ADMIN - PERIOD CONTROL
-# =========================================================
 
 elif st.session_state.page == "Period Control":
 
