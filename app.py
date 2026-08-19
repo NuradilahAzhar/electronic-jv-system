@@ -1,4 +1,11 @@
 import streamlit as st
+import pandas as pd
+from datetime import datetime
+
+
+# ==================================================
+# PAGE CONFIGURATION
+# ==================================================
 
 st.set_page_config(
     page_title="Electronic JV",
@@ -6,10 +13,12 @@ st.set_page_config(
     layout="wide"
 )
 
-# --------------------------------------------------
+
+# ==================================================
 # DEMO USER MASTER
-# Prototype only - do not use real credentials here
-# --------------------------------------------------
+# Prototype only
+# DO NOT use real employee passwords here
+# ==================================================
 
 USERS = {
     "1001": {
@@ -17,16 +26,19 @@ USERS = {
         "name": "Demo Preparer",
         "role": "PREPARER"
     },
+
     "2001": {
         "password": "approve123",
         "name": "Demo Assistant Manager",
         "role": "APPROVER"
     },
+
     "9001": {
         "password": "audit123",
         "name": "Demo Auditor",
         "role": "AUDITOR"
     },
+
     "8001": {
         "password": "admin123",
         "name": "Demo Admin",
@@ -34,9 +46,74 @@ USERS = {
     }
 }
 
-# --------------------------------------------------
+
+# ==================================================
+# DEMO G/L MASTER
+# Prototype only
+# ==================================================
+
+GL_MASTER = {
+    "3101/003": {
+        "description": "Cash at Bank - MBB",
+        "category": "Asset"
+    },
+
+    "3102/003": {
+        "description": "Repo - MBB",
+        "category": "Investment"
+    },
+
+    "3102/006": {
+        "description": "Short-term Investment - AmIncome",
+        "category": "Investment"
+    },
+
+    "3103/000": {
+        "description": "Repo - MBB",
+        "category": "Investment"
+    },
+
+    "8005/001": {
+        "description": "Interest Income - REPO MBB",
+        "category": "Income"
+    },
+
+    "8005/008": {
+        "description": "Interest Income - AmIncome",
+        "category": "Income"
+    },
+
+    "4100/001": {
+        "description": "Payroll Expense",
+        "category": "Expense"
+    },
+
+    "4200/001": {
+        "description": "Depreciation Expense",
+        "category": "Expense"
+    },
+
+    "2200/001": {
+        "description": "Accrued Expenses",
+        "category": "Liability"
+    },
+
+    "4300/001": {
+        "description": "Bank Charges",
+        "category": "Expense"
+    }
+}
+
+
+GL_OPTIONS = [
+    f"{code} - {details['description']}"
+    for code, details in GL_MASTER.items()
+]
+
+
+# ==================================================
 # SESSION INITIALISATION
-# --------------------------------------------------
+# ==================================================
 
 if "logged_in" not in st.session_state:
     st.session_state.logged_in = False
@@ -53,10 +130,13 @@ if "role" not in st.session_state:
 if "page" not in st.session_state:
     st.session_state.page = "Dashboard"
 
+if "demo_jv_sequence" not in st.session_state:
+    st.session_state.demo_jv_sequence = 1
 
-# --------------------------------------------------
-# LOGIN FUNCTION
-# --------------------------------------------------
+
+# ==================================================
+# LOGIN
+# ==================================================
 
 def login(employee_no, password):
 
@@ -80,9 +160,9 @@ def login(employee_no, password):
     return True
 
 
-# --------------------------------------------------
-# LOGOUT FUNCTION
-# --------------------------------------------------
+# ==================================================
+# LOGOUT
+# ==================================================
 
 def logout():
 
@@ -95,22 +175,15 @@ def logout():
     st.rerun()
 
 
-# --------------------------------------------------
-# LOGIN PAGE
-# --------------------------------------------------
+# ==================================================
+# LOGIN SCREEN
+# ==================================================
 
 if not st.session_state.logged_in:
 
     st.title("Electronic Journal Voucher System")
 
-    st.subheader("JKPSD Pilot")
-
-    st.write(
-        "Controlled electronic workflow for preparation, "
-        "review, approval and audit retrieval of Journal Vouchers."
-    )
-
-    st.divider()
+    st.caption("JKPSD Pilot")
 
     employee_no = st.text_input(
         "Employee Number"
@@ -121,13 +194,21 @@ if not st.session_state.logged_in:
         type="password"
     )
 
-    if st.button("Login"):
+    if st.button(
+        "Login",
+        type="primary"
+    ):
 
         if login(employee_no, password):
-            st.success("Login successful.")
+
+            st.success(
+                "Login successful."
+            )
+
             st.rerun()
 
         else:
+
             st.error(
                 "Invalid Employee Number or Password."
             )
@@ -135,28 +216,39 @@ if not st.session_state.logged_in:
     st.stop()
 
 
-# --------------------------------------------------
-# USER DETAILS
-# --------------------------------------------------
+# ==================================================
+# CURRENT USER
+# ==================================================
 
 employee_no = st.session_state.employee_no
 user_name = st.session_state.user_name
 role = st.session_state.role
 
 
-# --------------------------------------------------
+# ==================================================
 # SIDEBAR
-# --------------------------------------------------
+# ==================================================
 
 with st.sidebar:
 
     st.title("E-JV")
 
-    st.write(f"**{user_name}**")
-    st.caption(f"Employee No: {employee_no}")
-    st.caption(f"Role: {role}")
+    st.write(
+        f"**{user_name}**"
+    )
+
+    st.caption(
+        f"Employee No: {employee_no}"
+    )
+
+    st.caption(
+        f"Role: {role}"
+    )
 
     st.divider()
+
+
+    # PREPARER MENU
 
     if role == "PREPARER":
 
@@ -167,6 +259,9 @@ with st.sidebar:
             "New PIC Request"
         ]
 
+
+    # APPROVER MENU
+
     elif role == "APPROVER":
 
         menu_options = [
@@ -176,6 +271,9 @@ with st.sidebar:
             "New PIC Request"
         ]
 
+
+    # AUDITOR MENU
+
     elif role == "AUDITOR":
 
         menu_options = [
@@ -183,6 +281,9 @@ with st.sidebar:
             "Search JVs",
             "Audit Trail"
         ]
+
+
+    # ADMIN MENU
 
     elif role == "ADMIN":
 
@@ -194,8 +295,13 @@ with st.sidebar:
             "Period Control"
         ]
 
+
     else:
-        menu_options = ["Dashboard"]
+
+        menu_options = [
+            "Dashboard"
+        ]
+
 
     selected_page = st.radio(
         "Navigation",
@@ -207,135 +313,231 @@ with st.sidebar:
     st.divider()
 
     if st.button("Logout"):
+
         logout()
 
 
-# --------------------------------------------------
+# ==================================================
 # MAIN HEADER
-# --------------------------------------------------
+# ==================================================
 
-st.title("Electronic Journal Voucher System")
+st.title(
+    "Electronic Journal Voucher System"
+)
 
-st.caption("JKPSD Pilot")
-
-st.write(
-    f"Logged in as **{user_name}** "
-    f"({employee_no}) — **{role}**"
+st.caption(
+    "JKPSD Pilot"
 )
 
 st.divider()
 
 
-# --------------------------------------------------
+# ==================================================
 # DASHBOARD
-# --------------------------------------------------
+# ==================================================
 
 if st.session_state.page == "Dashboard":
 
     st.header("Dashboard")
 
-    col1, col2, col3, col4 = st.columns(4)
+
+    # PREPARER DASHBOARD
 
     if role == "PREPARER":
 
-        col1.metric("Draft", 0)
-        col2.metric("Pending Approval", 0)
-        col3.metric("Amendment Required", 0)
-        col4.metric("Approved", 0)
+        col1, col2, col3, col4 = st.columns(4)
+
+        col1.metric(
+            "Draft",
+            0
+        )
+
+        col2.metric(
+            "Pending Approval",
+            0
+        )
+
+        col3.metric(
+            "Amendment Required",
+            0
+        )
+
+        col4.metric(
+            "Approved",
+            0
+        )
 
         st.info(
-            "You can create, edit and submit Journal Vouchers. "
-            "You cannot approve Journal Vouchers."
+            "Prepare and submit JVs. Approval access is restricted."
         )
+
+
+    # APPROVER DASHBOARD
 
     elif role == "APPROVER":
 
-        col1.metric("Pending Approval", 0)
-        col2.metric("Resubmitted", 0)
-        col3.metric("Approved Today", 0)
-        col4.metric("Returned Today", 0)
+        col1, col2, col3, col4 = st.columns(4)
+
+        col1.metric(
+            "Pending Approval",
+            0
+        )
+
+        col2.metric(
+            "Resubmitted",
+            0
+        )
+
+        col3.metric(
+            "Approved Today",
+            0
+        )
+
+        col4.metric(
+            "Returned Today",
+            0
+        )
 
         st.info(
-            "You can review, approve or return Journal Vouchers. "
-            "You cannot prepare Journal Vouchers."
+            "Review, approve or return submitted JVs."
         )
+
+
+    # AUDITOR DASHBOARD
 
     elif role == "AUDITOR":
 
-        col1.metric("Approved JVs", 0)
-        col2.metric("Posted to UBS", 0)
-        col3.metric("Cancelled", 0)
-        col4.metric("Audit Records", 0)
+        col1, col2, col3, col4 = st.columns(4)
+
+        col1.metric(
+            "Approved JVs",
+            0
+        )
+
+        col2.metric(
+            "Posted to UBS",
+            0
+        )
+
+        col3.metric(
+            "Cancelled",
+            0
+        )
+
+        col4.metric(
+            "Audit Records",
+            0
+        )
 
         st.info(
-            "Auditor / Guest access is read-only."
+            "Read-only Guest / Auditor access."
         )
+
+
+    # ADMIN DASHBOARD
 
     elif role == "ADMIN":
 
-        col1.metric("Active Users", 4)
-        col2.metric("Active G/L Codes", 0)
-        col3.metric("Open Periods", 0)
-        col4.metric("JV Types", 0)
+        col1, col2, col3, col4 = st.columns(4)
+
+        col1.metric(
+            "Active Users",
+            4
+        )
+
+        col2.metric(
+            "Active G/L Codes",
+            len(GL_MASTER)
+        )
+
+        col3.metric(
+            "Open Periods",
+            0
+        )
+
+        col4.metric(
+            "JV Types",
+            7
+        )
 
         st.info(
-            "Admin maintains master data and user access. "
-            "Admin cannot prepare or approve Journal Vouchers."
+            "Master data and access administration."
         )
 
 
-# --------------------------------------------------
-# PREPARER PAGES
-# --------------------------------------------------
+# ==================================================
+# CREATE NEW JV
+# ==================================================
 
 elif st.session_state.page == "Create New JV":
 
+    # ----------------------------------------------
+    # ACCESS CONTROL
+    # ----------------------------------------------
+
     if role != "PREPARER":
-        st.error("Access denied.")
+
+        st.error(
+            "Access denied."
+        )
+
         st.stop()
 
-    st.header("Create New Journal Voucher")
 
     # ----------------------------------------------
-    # DEMO JV NUMBER
-    # Prototype only
+    # AUTOMATIC JV NUMBER
     # ----------------------------------------------
-
-    from datetime import datetime
 
     current_period = datetime.now().strftime("%y%m")
-
-    if "demo_jv_sequence" not in st.session_state:
-        st.session_state.demo_jv_sequence = 1
 
     jv_number = (
         f"JV{current_period}"
         f"{st.session_state.demo_jv_sequence:02d}"
     )
 
-    st.info(
-        f"System Generated JV Number: **{jv_number}**"
-    )
-
-    st.caption(
-        "Prototype numbering only. "
-        "A database-controlled sequence will be added later."
-    )
-
-    st.divider()
 
     # ----------------------------------------------
     # JV HEADER
     # ----------------------------------------------
 
-    st.subheader("JV Header")
+    col_title, col_number = st.columns(
+        [3, 1]
+    )
+
+
+    with col_title:
+
+        st.markdown(
+            "### JK PSD SDN BHD"
+        )
+
+        st.markdown(
+            "## JOURNAL VOUCHER"
+        )
+
+
+    with col_number:
+
+        st.markdown(
+            "### JV No."
+        )
+
+        st.markdown(
+            f"## {jv_number}"
+        )
+
+
+    st.divider()
+
+
+    # ----------------------------------------------
+    # BASIC JV DETAILS
+    # ----------------------------------------------
 
     col1, col2 = st.columns(2)
 
+
     with col1:
-        jv_date = st.date_input(
-            "JV Date"
-        )
 
         jv_type = st.selectbox(
             "JV Type",
@@ -350,263 +552,158 @@ elif st.session_state.page == "Create New JV":
             ]
         )
 
+
     with col2:
-        accounting_month = st.selectbox(
+
+        accounting_period = st.date_input(
             "Accounting Month",
-            [
-                "January",
-                "February",
-                "March",
-                "April",
-                "May",
-                "June",
-                "July",
-                "August",
-                "September",
-                "October",
-                "November",
-                "December"
-            ]
+            value=datetime.now().date()
         )
 
-        accounting_year = st.number_input(
-            "Accounting Year",
-            min_value=2024,
-            max_value=2035,
-            value=datetime.now().year,
-            step=1
-        )
 
-    description = st.text_area(
-        "JV Description"
+    remarks = st.text_input(
+        "JV Description / Remarks"
     )
+
 
     st.divider()
 
-    # ----------------------------------------------
-    # CONTROLLED G/L MASTER
-    # Demo only
-    # ----------------------------------------------
-
-    st.subheader("Journal Lines")
-
-    GL_MASTER = {
-        "110001": {
-            "description": "Cash at Bank",
-            "category": "Asset"
-        },
-        "120001": {
-            "description": "Accounts Receivable",
-            "category": "Asset"
-        },
-        "210001": {
-            "description": "Accounts Payable",
-            "category": "Liability"
-        },
-        "220001": {
-            "description": "Accrued Expenses",
-            "category": "Liability"
-        },
-        "410001": {
-            "description": "Payroll Expense",
-            "category": "Expense"
-        },
-        "420001": {
-            "description": "Depreciation Expense",
-            "category": "Expense"
-        },
-        "430001": {
-            "description": "Bank Charges",
-            "category": "Expense"
-        }
-    }
-
-    gl_options = [
-        f"{code} - {details['description']}"
-        for code, details in GL_MASTER.items()
-    ]
 
     # ----------------------------------------------
-    # LINE 1
+    # JOURNAL ENTRY TABLE
     # ----------------------------------------------
 
-    st.markdown("### Line 1")
-
-    line1_gl = st.selectbox(
-        "G/L Code - Line 1",
-        gl_options,
-        key="line1_gl"
+    st.subheader(
+        "Journal Entries"
     )
 
-    line1_description = st.text_input(
-        "Line Description - Line 1",
-        key="line1_description"
+
+    initial_journal = pd.DataFrame(
+        [
+            {
+                "Date": None,
+                "A/C Code": None,
+                "Description": "",
+                "Dr": 0.00,
+                "Cr": 0.00
+            },
+
+            {
+                "Date": None,
+                "A/C Code": None,
+                "Description": "",
+                "Dr": 0.00,
+                "Cr": 0.00
+            }
+        ]
     )
 
-    col1, col2 = st.columns(2)
 
-    with col1:
-        line1_debit = st.number_input(
-            "Debit - Line 1",
-            min_value=0.00,
-            value=0.00,
-            step=100.00,
-            format="%.2f",
-            key="line1_debit"
-        )
+    journal_df = st.data_editor(
 
-    with col2:
-        line1_credit = st.number_input(
-            "Credit - Line 1",
-            min_value=0.00,
-            value=0.00,
-            step=100.00,
-            format="%.2f",
-            key="line1_credit"
-        )
+        initial_journal,
 
-    st.divider()
+        num_rows="dynamic",
+
+        hide_index=True,
+
+        use_container_width=True,
+
+        column_config={
+
+            "Date": st.column_config.DateColumn(
+                "Date",
+                format="DD/MM/YYYY",
+                required=False
+            ),
+
+            "A/C Code": st.column_config.SelectboxColumn(
+                "A/C Code",
+                options=GL_OPTIONS,
+                required=False
+            ),
+
+            "Description": st.column_config.TextColumn(
+                "Description",
+                width="large"
+            ),
+
+            "Dr": st.column_config.NumberColumn(
+                "Dr",
+                min_value=0.00,
+                format="%.2f"
+            ),
+
+            "Cr": st.column_config.NumberColumn(
+                "Cr",
+                min_value=0.00,
+                format="%.2f"
+            )
+        },
+
+        key="journal_editor"
+    )
+
 
     # ----------------------------------------------
-    # LINE 2
+    # CONVERT AMOUNTS
     # ----------------------------------------------
 
-    st.markdown("### Line 2")
+    debit_series = pd.to_numeric(
+        journal_df["Dr"],
+        errors="coerce"
+    ).fillna(0)
 
-    line2_gl = st.selectbox(
-        "G/L Code - Line 2",
-        gl_options,
-        key="line2_gl"
-    )
 
-    line2_description = st.text_input(
-        "Line Description - Line 2",
-        key="line2_description"
-    )
+    credit_series = pd.to_numeric(
+        journal_df["Cr"],
+        errors="coerce"
+    ).fillna(0)
 
-    col1, col2 = st.columns(2)
 
-    with col1:
-        line2_debit = st.number_input(
-            "Debit - Line 2",
-            min_value=0.00,
-            value=0.00,
-            step=100.00,
-            format="%.2f",
-            key="line2_debit"
-        )
+    total_debit = debit_series.sum()
 
-    with col2:
-        line2_credit = st.number_input(
-            "Credit - Line 2",
-            min_value=0.00,
-            value=0.00,
-            step=100.00,
-            format="%.2f",
-            key="line2_credit"
-        )
+    total_credit = credit_series.sum()
+
+    difference = total_debit - total_credit
+
 
     # ----------------------------------------------
     # TOTALS
     # ----------------------------------------------
 
-    total_debit = (
-        line1_debit +
-        line2_debit
-    )
-
-    total_credit = (
-        line1_credit +
-        line2_credit
-    )
-
     st.divider()
-
-    st.subheader("JV Validation")
 
     col1, col2, col3 = st.columns(3)
 
+
     col1.metric(
-        "Total Debit",
+        "Total Dr",
         f"RM {total_debit:,.2f}"
     )
 
+
     col2.metric(
-        "Total Credit",
+        "Total Cr",
         f"RM {total_credit:,.2f}"
     )
 
-    difference = total_debit - total_credit
 
     col3.metric(
         "Difference",
         f"RM {difference:,.2f}"
     )
 
-    # ----------------------------------------------
-    # VALIDATION RULES
-    # ----------------------------------------------
-
-    errors = []
-
-    if not description.strip():
-        errors.append(
-            "JV Description is required."
-        )
-
-    if not line1_description.strip():
-        errors.append(
-            "Line 1 description is required."
-        )
-
-    if not line2_description.strip():
-        errors.append(
-            "Line 2 description is required."
-        )
-
-    if line1_debit > 0 and line1_credit > 0:
-        errors.append(
-            "Line 1 cannot contain both debit and credit."
-        )
-
-    if line2_debit > 0 and line2_credit > 0:
-        errors.append(
-            "Line 2 cannot contain both debit and credit."
-        )
-
-    if line1_debit == 0 and line1_credit == 0:
-        errors.append(
-            "Line 1 requires a debit or credit amount."
-        )
-
-    if line2_debit == 0 and line2_credit == 0:
-        errors.append(
-            "Line 2 requires a debit or credit amount."
-        )
-
-    if total_debit == 0:
-        errors.append(
-            "JV total cannot be zero."
-        )
-
-    if total_debit != total_credit:
-        errors.append(
-            f"Submission is not allowed because the "
-            f"total debit of RM{total_debit:,.2f} "
-            f"does not match the total credit of "
-            f"RM{total_credit:,.2f}."
-        )
 
     # ----------------------------------------------
-    # SUPPORTING DOCUMENT
+    # SUPPORTING DOCUMENTS
+    # OPTIONAL
     # ----------------------------------------------
 
     st.divider()
 
-    st.subheader("Supporting Documents")
-
     uploaded_files = st.file_uploader(
-        "Upload Supporting Documents",
+        "Supporting Documents (Optional)",
         type=[
             "pdf",
             "xlsx",
@@ -619,163 +716,444 @@ elif st.session_state.page == "Create New JV":
         accept_multiple_files=True
     )
 
-    if not uploaded_files:
-        errors.append(
-            "At least one supporting document is required."
-        )
 
     # ----------------------------------------------
-    # DISPLAY VALIDATION
+    # VALIDATION
+    # ----------------------------------------------
+
+    errors = []
+
+
+    # Identify rows that user actually used
+
+    active_rows = []
+
+
+    for index, row in journal_df.iterrows():
+
+        debit = float(
+            debit_series.iloc[index]
+        )
+
+        credit = float(
+            credit_series.iloc[index]
+        )
+
+
+        has_data = (
+
+            pd.notna(row["Date"])
+
+            or pd.notna(row["A/C Code"])
+
+            or str(row["Description"]).strip() != ""
+
+            or debit > 0
+
+            or credit > 0
+        )
+
+
+        if has_data:
+
+            active_rows.append(
+                index
+            )
+
+
+    # At least two accounting lines
+
+    if len(active_rows) < 2:
+
+        errors.append(
+            "Minimum two journal lines are required."
+        )
+
+
+    # Validate individual rows
+
+    for index in active_rows:
+
+        row = journal_df.iloc[index]
+
+        debit = float(
+            debit_series.iloc[index]
+        )
+
+        credit = float(
+            credit_series.iloc[index]
+        )
+
+
+        line_no = index + 1
+
+
+        if pd.isna(
+            row["Date"]
+        ):
+
+            errors.append(
+                f"Line {line_no}: Date is required."
+            )
+
+
+        if pd.isna(
+            row["A/C Code"]
+        ):
+
+            errors.append(
+                f"Line {line_no}: A/C Code is required."
+            )
+
+
+        if (
+            str(
+                row["Description"]
+            ).strip() == ""
+        ):
+
+            errors.append(
+                f"Line {line_no}: Description is required."
+            )
+
+
+        if (
+            debit > 0
+            and credit > 0
+        ):
+
+            errors.append(
+                f"Line {line_no}: "
+                "Enter either Dr or Cr, not both."
+            )
+
+
+        if (
+            debit == 0
+            and credit == 0
+        ):
+
+            errors.append(
+                f"Line {line_no}: "
+                "Dr or Cr amount is required."
+            )
+
+
+    # Overall JV validations
+
+    if total_debit == 0:
+
+        errors.append(
+            "JV total cannot be zero."
+        )
+
+
+    if round(
+        total_debit,
+        2
+    ) != round(
+        total_credit,
+        2
+    ):
+
+        errors.append(
+
+            f"Total Dr RM{total_debit:,.2f} "
+            f"does not match "
+            f"Total Cr RM{total_credit:,.2f}."
+        )
+
+
+    # ----------------------------------------------
+    # VALIDATION RESULT
     # ----------------------------------------------
 
     st.divider()
 
+
     if errors:
 
         st.error(
-            "JV validation is not complete."
+            "JV not ready for submission."
         )
 
-        for error in errors:
-            st.write(f"- {error}")
+
+        with st.expander(
+            "View validation issues"
+        ):
+
+            for error in errors:
+
+                st.write(
+                    f"• {error}"
+                )
+
 
         submit_disabled = True
+
 
     else:
 
         st.success(
-            "JV validation completed successfully."
+            "Balanced ✓"
         )
 
         submit_disabled = False
 
+
     # ----------------------------------------------
-    # SUBMIT
+    # BUTTONS
     # ----------------------------------------------
 
-    if st.button(
-        "Submit for Approval",
-        disabled=submit_disabled
-    ):
+    col1, col2 = st.columns(
+        [1, 1]
+    )
 
-        st.success(
-            f"{jv_number} submitted successfully "
-            f"for approval."
-        )
 
-        st.session_state.demo_jv_sequence += 1
+    with col1:
 
-        st.warning(
-            "Prototype only: this JV is not yet saved "
-            "to a database."
-        )
+        if st.button(
+            "Save Draft",
+            use_container_width=True
+        ):
 
+            st.success(
+                f"{jv_number} saved as Draft."
+            )
+
+            st.warning(
+                "Prototype only - database storage "
+                "will be added next."
+            )
+
+
+    with col2:
+
+        if st.button(
+            "Submit for Approval",
+            type="primary",
+            disabled=submit_disabled,
+            use_container_width=True
+        ):
+
+            st.success(
+                f"{jv_number} submitted for approval."
+            )
+
+            st.session_state.demo_jv_sequence += 1
+
+            st.warning(
+                "Prototype only - database workflow "
+                "will be added next."
+            )
+
+
+# ==================================================
+# MY JVs
+# ==================================================
 
 elif st.session_state.page == "My JVs":
 
     if role != "PREPARER":
-        st.error("Access denied.")
+
+        st.error(
+            "Access denied."
+        )
+
         st.stop()
 
-    st.header("My Journal Vouchers")
+
+    st.header(
+        "My Journal Vouchers"
+    )
+
 
     st.info(
-        "Your Draft, Pending Approval, Amendment Required "
+        "Draft, Pending Approval, Amendment Required "
         "and Approved JVs will appear here."
     )
 
 
-# --------------------------------------------------
-# APPROVER PAGES
-# --------------------------------------------------
+# ==================================================
+# APPROVAL INBOX
+# ==================================================
 
 elif st.session_state.page == "Approval Inbox":
 
     if role != "APPROVER":
-        st.error("Access denied.")
+
+        st.error(
+            "Access denied."
+        )
+
         st.stop()
 
-    st.header("Approval Inbox")
 
-    st.info(
-        "Journal Vouchers awaiting your review will appear here."
+    st.header(
+        "Approval Inbox"
     )
 
 
-# --------------------------------------------------
-# SHARED SEARCH PAGE
-# --------------------------------------------------
+    st.info(
+        "JVs awaiting review will appear here."
+    )
+
+
+# ==================================================
+# SEARCH JVs
+# ==================================================
 
 elif st.session_state.page == "Search JVs":
 
-    if role not in ["APPROVER", "AUDITOR"]:
-        st.error("Access denied.")
+    if role not in [
+        "APPROVER",
+        "AUDITOR"
+    ]:
+
+        st.error(
+            "Access denied."
+        )
+
         st.stop()
 
-    st.header("Search Journal Vouchers")
 
-    st.info(
-        "JV search and audit retrieval will be built later."
+    st.header(
+        "Search Journal Vouchers"
     )
 
 
-# --------------------------------------------------
-# AUDITOR PAGE
-# --------------------------------------------------
+    col1, col2, col3 = st.columns(3)
+
+
+    with col1:
+
+        st.text_input(
+            "JV Number"
+        )
+
+
+    with col2:
+
+        st.selectbox(
+            "Status",
+            [
+                "All",
+                "Draft",
+                "Pending Approval",
+                "Amendment Required",
+                "Resubmitted",
+                "Approved",
+                "Posted to UBS",
+                "Cancelled"
+            ]
+        )
+
+
+    with col3:
+
+        st.selectbox(
+            "JV Type",
+            [
+                "All",
+                "Depreciation",
+                "Payroll",
+                "AmIncome Placement",
+                "Bank",
+                "Accrual",
+                "Provision",
+                "Other"
+            ]
+        )
+
+
+    st.info(
+        "JV database search will be connected later."
+    )
+
+
+# ==================================================
+# AUDIT TRAIL
+# ==================================================
 
 elif st.session_state.page == "Audit Trail":
 
     if role != "AUDITOR":
-        st.error("Access denied.")
+
+        st.error(
+            "Access denied."
+        )
+
         st.stop()
 
-    st.header("Audit Trail")
+
+    st.header(
+        "Audit Trail"
+    )
+
 
     st.warning(
         "Read-only access."
     )
 
+
     st.info(
-        "Complete JV activity history will appear here."
+        "JV activity history will appear here."
     )
 
 
-# --------------------------------------------------
+# ==================================================
 # NEW PIC REQUEST
-# --------------------------------------------------
+# ==================================================
 
 elif st.session_state.page == "New PIC Request":
 
-    if role not in ["PREPARER", "APPROVER"]:
-        st.error("Access denied.")
+    if role not in [
+        "PREPARER",
+        "APPROVER"
+    ]:
+
+        st.error(
+            "Access denied."
+        )
+
         st.stop()
 
-    st.header("New PIC / User Change Request")
 
-    st.write(
-        "Use this form to request a change of Finance PIC. "
-        "Submission does not automatically create or activate an account."
+    st.header(
+        "New PIC / User Change Request"
     )
 
-    new_employee_no = st.text_input(
-        "New Employee Number"
-    )
 
-    new_employee_name = st.text_input(
-        "New Employee Name"
-    )
+    col1, col2 = st.columns(2)
 
-    requested_role = st.selectbox(
-        "Requested Role",
-        [
-            "PREPARER",
-            "APPROVER"
-        ]
-    )
 
-    effective_date = st.date_input(
-        "Effective Date"
-    )
+    with col1:
+
+        new_employee_no = st.text_input(
+            "New Employee Number"
+        )
+
+
+        new_employee_name = st.text_input(
+            "New Employee Name"
+        )
+
+
+    with col2:
+
+        requested_role = st.selectbox(
+            "Requested Role",
+            [
+                "PREPARER",
+                "APPROVER"
+            ]
+        )
+
+
+        effective_date = st.date_input(
+            "Effective Date"
+        )
+
 
     reason = st.selectbox(
         "Reason",
@@ -787,86 +1165,282 @@ elif st.session_state.page == "New PIC Request":
         ]
     )
 
+
     comments = st.text_area(
         "Comments"
     )
 
-    if st.button("Submit PIC Request"):
+
+    if st.button(
+        "Submit PIC Request",
+        type="primary"
+    ):
 
         if not new_employee_no:
+
             st.error(
-                "New Employee Number is required."
+                "Employee Number is required."
             )
+
 
         elif not new_employee_name:
+
             st.error(
-                "New Employee Name is required."
+                "Employee Name is required."
             )
+
 
         else:
+
             st.success(
-                "PIC request submitted for administrator review."
-            )
-
-            st.warning(
-                "Prototype only: the request is not yet saved "
-                "to a database."
+                "PIC request submitted for Admin review."
             )
 
 
-# --------------------------------------------------
-# ADMIN PAGES
-# --------------------------------------------------
+# ==================================================
+# USER MANAGEMENT
+# ==================================================
 
 elif st.session_state.page == "User Management":
 
     if role != "ADMIN":
-        st.error("Access denied.")
+
+        st.error(
+            "Access denied."
+        )
+
         st.stop()
 
-    st.header("User Management")
 
-    st.info(
-        "Admin will manage user activation, deactivation "
-        "and role assignment here."
+    st.header(
+        "User Management"
     )
 
+
+    user_data = pd.DataFrame(
+        [
+            {
+                "Employee No": "1001",
+                "Name": "Demo Preparer",
+                "Role": "PREPARER",
+                "Status": "ACTIVE"
+            },
+
+            {
+                "Employee No": "2001",
+                "Name": "Demo Assistant Manager",
+                "Role": "APPROVER",
+                "Status": "ACTIVE"
+            },
+
+            {
+                "Employee No": "9001",
+                "Name": "Demo Auditor",
+                "Role": "AUDITOR",
+                "Status": "ACTIVE"
+            },
+
+            {
+                "Employee No": "8001",
+                "Name": "Demo Admin",
+                "Role": "ADMIN",
+                "Status": "ACTIVE"
+            }
+        ]
+    )
+
+
+    st.dataframe(
+        user_data,
+        use_container_width=True,
+        hide_index=True
+    )
+
+
+    st.caption(
+        "User activation/deactivation will be "
+        "connected to the database later."
+    )
+
+
+# ==================================================
+# G/L MASTER
+# ==================================================
 
 elif st.session_state.page == "G/L Master":
 
     if role != "ADMIN":
-        st.error("Access denied.")
+
+        st.error(
+            "Access denied."
+        )
+
         st.stop()
 
-    st.header("G/L Master")
 
-    st.info(
-        "Controlled G/L Master maintenance will be built here."
+    st.header(
+        "G/L Master"
     )
 
+
+    gl_rows = []
+
+
+    for code, details in GL_MASTER.items():
+
+        gl_rows.append(
+            {
+                "A/C Code": code,
+                "Description": details["description"],
+                "Category": details["category"],
+                "Status": "ACTIVE"
+            }
+        )
+
+
+    gl_dataframe = pd.DataFrame(
+        gl_rows
+    )
+
+
+    st.dataframe(
+        gl_dataframe,
+        use_container_width=True,
+        hide_index=True
+    )
+
+
+# ==================================================
+# JV TYPE MASTER
+# ==================================================
 
 elif st.session_state.page == "JV Type Master":
 
     if role != "ADMIN":
-        st.error("Access denied.")
+
+        st.error(
+            "Access denied."
+        )
+
         st.stop()
 
-    st.header("JV Type Master")
 
-    st.info(
-        "JV Type and supporting-document requirements "
-        "will be maintained here."
+    st.header(
+        "JV Type Master"
     )
 
+
+    jv_type_data = pd.DataFrame(
+        [
+            {
+                "JV Type": "Depreciation",
+                "Attachment": "Optional"
+            },
+
+            {
+                "JV Type": "Payroll",
+                "Attachment": "Optional"
+            },
+
+            {
+                "JV Type": "AmIncome Placement",
+                "Attachment": "Optional"
+            },
+
+            {
+                "JV Type": "Bank",
+                "Attachment": "Optional"
+            },
+
+            {
+                "JV Type": "Accrual",
+                "Attachment": "Optional"
+            },
+
+            {
+                "JV Type": "Provision",
+                "Attachment": "Optional"
+            },
+
+            {
+                "JV Type": "Other",
+                "Attachment": "Optional"
+            }
+        ]
+    )
+
+
+    st.dataframe(
+        jv_type_data,
+        use_container_width=True,
+        hide_index=True
+    )
+
+
+# ==================================================
+# PERIOD CONTROL
+# ==================================================
 
 elif st.session_state.page == "Period Control":
 
     if role != "ADMIN":
-        st.error("Access denied.")
+
+        st.error(
+            "Access denied."
+        )
+
         st.stop()
 
-    st.header("Accounting Period Control")
 
-    st.info(
-        "Open and closed accounting periods will be managed here."
+    st.header(
+        "Accounting Period Control"
     )
+
+
+    st.selectbox(
+        "Accounting Year",
+        [
+            2025,
+            2026,
+            2027
+        ],
+        index=1
+    )
+
+
+    st.selectbox(
+        "Accounting Month",
+        [
+            "January",
+            "February",
+            "March",
+            "April",
+            "May",
+            "June",
+            "July",
+            "August",
+            "September",
+            "October",
+            "November",
+            "December"
+        ]
+    )
+
+
+    st.radio(
+        "Period Status",
+        [
+            "OPEN",
+            "CLOSED"
+        ],
+        horizontal=True
+    )
+
+
+    if st.button(
+        "Update Period"
+    ):
+
+        st.success(
+            "Prototype period status updated."
+        )
