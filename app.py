@@ -296,9 +296,379 @@ elif st.session_state.page == "Create New JV":
 
     st.header("Create New Journal Voucher")
 
-    st.info(
-        "This module will be built in the next stage."
+    # ----------------------------------------------
+    # DEMO JV NUMBER
+    # Prototype only
+    # ----------------------------------------------
+
+    from datetime import datetime
+
+    current_period = datetime.now().strftime("%y%m")
+
+    if "demo_jv_sequence" not in st.session_state:
+        st.session_state.demo_jv_sequence = 1
+
+    jv_number = (
+        f"JV{current_period}"
+        f"{st.session_state.demo_jv_sequence:02d}"
     )
+
+    st.info(
+        f"System Generated JV Number: **{jv_number}**"
+    )
+
+    st.caption(
+        "Prototype numbering only. "
+        "A database-controlled sequence will be added later."
+    )
+
+    st.divider()
+
+    # ----------------------------------------------
+    # JV HEADER
+    # ----------------------------------------------
+
+    st.subheader("JV Header")
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        jv_date = st.date_input(
+            "JV Date"
+        )
+
+        jv_type = st.selectbox(
+            "JV Type",
+            [
+                "Depreciation",
+                "Payroll",
+                "AmIncome Placement",
+                "Bank",
+                "Accrual",
+                "Provision",
+                "Other"
+            ]
+        )
+
+    with col2:
+        accounting_month = st.selectbox(
+            "Accounting Month",
+            [
+                "January",
+                "February",
+                "March",
+                "April",
+                "May",
+                "June",
+                "July",
+                "August",
+                "September",
+                "October",
+                "November",
+                "December"
+            ]
+        )
+
+        accounting_year = st.number_input(
+            "Accounting Year",
+            min_value=2024,
+            max_value=2035,
+            value=datetime.now().year,
+            step=1
+        )
+
+    description = st.text_area(
+        "JV Description"
+    )
+
+    st.divider()
+
+    # ----------------------------------------------
+    # CONTROLLED G/L MASTER
+    # Demo only
+    # ----------------------------------------------
+
+    st.subheader("Journal Lines")
+
+    GL_MASTER = {
+        "110001": {
+            "description": "Cash at Bank",
+            "category": "Asset"
+        },
+        "120001": {
+            "description": "Accounts Receivable",
+            "category": "Asset"
+        },
+        "210001": {
+            "description": "Accounts Payable",
+            "category": "Liability"
+        },
+        "220001": {
+            "description": "Accrued Expenses",
+            "category": "Liability"
+        },
+        "410001": {
+            "description": "Payroll Expense",
+            "category": "Expense"
+        },
+        "420001": {
+            "description": "Depreciation Expense",
+            "category": "Expense"
+        },
+        "430001": {
+            "description": "Bank Charges",
+            "category": "Expense"
+        }
+    }
+
+    gl_options = [
+        f"{code} - {details['description']}"
+        for code, details in GL_MASTER.items()
+    ]
+
+    # ----------------------------------------------
+    # LINE 1
+    # ----------------------------------------------
+
+    st.markdown("### Line 1")
+
+    line1_gl = st.selectbox(
+        "G/L Code - Line 1",
+        gl_options,
+        key="line1_gl"
+    )
+
+    line1_description = st.text_input(
+        "Line Description - Line 1",
+        key="line1_description"
+    )
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        line1_debit = st.number_input(
+            "Debit - Line 1",
+            min_value=0.00,
+            value=0.00,
+            step=100.00,
+            format="%.2f",
+            key="line1_debit"
+        )
+
+    with col2:
+        line1_credit = st.number_input(
+            "Credit - Line 1",
+            min_value=0.00,
+            value=0.00,
+            step=100.00,
+            format="%.2f",
+            key="line1_credit"
+        )
+
+    st.divider()
+
+    # ----------------------------------------------
+    # LINE 2
+    # ----------------------------------------------
+
+    st.markdown("### Line 2")
+
+    line2_gl = st.selectbox(
+        "G/L Code - Line 2",
+        gl_options,
+        key="line2_gl"
+    )
+
+    line2_description = st.text_input(
+        "Line Description - Line 2",
+        key="line2_description"
+    )
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        line2_debit = st.number_input(
+            "Debit - Line 2",
+            min_value=0.00,
+            value=0.00,
+            step=100.00,
+            format="%.2f",
+            key="line2_debit"
+        )
+
+    with col2:
+        line2_credit = st.number_input(
+            "Credit - Line 2",
+            min_value=0.00,
+            value=0.00,
+            step=100.00,
+            format="%.2f",
+            key="line2_credit"
+        )
+
+    # ----------------------------------------------
+    # TOTALS
+    # ----------------------------------------------
+
+    total_debit = (
+        line1_debit +
+        line2_debit
+    )
+
+    total_credit = (
+        line1_credit +
+        line2_credit
+    )
+
+    st.divider()
+
+    st.subheader("JV Validation")
+
+    col1, col2, col3 = st.columns(3)
+
+    col1.metric(
+        "Total Debit",
+        f"RM {total_debit:,.2f}"
+    )
+
+    col2.metric(
+        "Total Credit",
+        f"RM {total_credit:,.2f}"
+    )
+
+    difference = total_debit - total_credit
+
+    col3.metric(
+        "Difference",
+        f"RM {difference:,.2f}"
+    )
+
+    # ----------------------------------------------
+    # VALIDATION RULES
+    # ----------------------------------------------
+
+    errors = []
+
+    if not description.strip():
+        errors.append(
+            "JV Description is required."
+        )
+
+    if not line1_description.strip():
+        errors.append(
+            "Line 1 description is required."
+        )
+
+    if not line2_description.strip():
+        errors.append(
+            "Line 2 description is required."
+        )
+
+    if line1_debit > 0 and line1_credit > 0:
+        errors.append(
+            "Line 1 cannot contain both debit and credit."
+        )
+
+    if line2_debit > 0 and line2_credit > 0:
+        errors.append(
+            "Line 2 cannot contain both debit and credit."
+        )
+
+    if line1_debit == 0 and line1_credit == 0:
+        errors.append(
+            "Line 1 requires a debit or credit amount."
+        )
+
+    if line2_debit == 0 and line2_credit == 0:
+        errors.append(
+            "Line 2 requires a debit or credit amount."
+        )
+
+    if total_debit == 0:
+        errors.append(
+            "JV total cannot be zero."
+        )
+
+    if total_debit != total_credit:
+        errors.append(
+            f"Submission is not allowed because the "
+            f"total debit of RM{total_debit:,.2f} "
+            f"does not match the total credit of "
+            f"RM{total_credit:,.2f}."
+        )
+
+    # ----------------------------------------------
+    # SUPPORTING DOCUMENT
+    # ----------------------------------------------
+
+    st.divider()
+
+    st.subheader("Supporting Documents")
+
+    uploaded_files = st.file_uploader(
+        "Upload Supporting Documents",
+        type=[
+            "pdf",
+            "xlsx",
+            "xls",
+            "docx",
+            "jpg",
+            "jpeg",
+            "png"
+        ],
+        accept_multiple_files=True
+    )
+
+    if not uploaded_files:
+        errors.append(
+            "At least one supporting document is required."
+        )
+
+    # ----------------------------------------------
+    # DISPLAY VALIDATION
+    # ----------------------------------------------
+
+    st.divider()
+
+    if errors:
+
+        st.error(
+            "JV validation is not complete."
+        )
+
+        for error in errors:
+            st.write(f"- {error}")
+
+        submit_disabled = True
+
+    else:
+
+        st.success(
+            "JV validation completed successfully."
+        )
+
+        submit_disabled = False
+
+    # ----------------------------------------------
+    # SUBMIT
+    # ----------------------------------------------
+
+    if st.button(
+        "Submit for Approval",
+        disabled=submit_disabled
+    ):
+
+        st.success(
+            f"{jv_number} submitted successfully "
+            f"for approval."
+        )
+
+        st.session_state.demo_jv_sequence += 1
+
+        st.warning(
+            "Prototype only: this JV is not yet saved "
+            "to a database."
+        )
 
 
 elif st.session_state.page == "My JVs":
