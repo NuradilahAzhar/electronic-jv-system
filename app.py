@@ -170,6 +170,31 @@ def initialise_database():
         )
     """)
 
+    # Internal revision snapshots are retained for control purposes.
+    # They are NOT displayed to the Auditor / Guest role.
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS jv_revisions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            jv_id INTEGER NOT NULL,
+            revision_no INTEGER NOT NULL,
+            snapshot_json TEXT NOT NULL,
+            created_by TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(jv_id) REFERENCES jv_headers(id)
+        )
+    """)
+
+    # Safe migration for databases created by an earlier prototype version.
+    header_columns = [
+        row[1]
+        for row in cursor.execute("PRAGMA table_info(jv_headers)").fetchall()
+    ]
+
+    if "revision_no" not in header_columns:
+        cursor.execute(
+            "ALTER TABLE jv_headers ADD COLUMN revision_no INTEGER NOT NULL DEFAULT 1"
+        )
+
     conn.commit()
     conn.close()
 
@@ -442,6 +467,594 @@ def save_jv(
     return jv_id
 
 
+def get_jv_lines_for_edit(jv_id):
+
+    conn = get_connection()
+
+    rows = conn.execute("""
+        SELECT
+            line_date,
+            gl_code,
+            gl_description,
+            description,
+            debit,
+            credit
+        FROM jv_lines
+        WHERE jv_id = ?
+        ORDER BY line_no
+    """, (jv_id,)).fetchall()
+
+    conn.close()
+
+    data = []
+
+    for (
+        line_date,
+        gl_code,
+        gl_description,
+        description,
+        debit,
+        credit
+    ) in rows:
+
+        try:
+            edit_date = datetime.strptime(
+                str(line_date)[:10],
+                "%Y-%m-%d"
+            ).date()
+        except:
+            edit_date = None
+
+        gl_value = gl_code
+
+        if gl_description:
+            gl_value = f"{gl_code} - {gl_description}"
+
+        data.append({
+            "Date": edit_date,
+            "A/C Code": gl_value,
+            "Description": description,
+            "Dr": float(debit or 0),
+            "Cr": float(credit or 0)
+        })
+
+    return pd.DataFrame(data)
+
+
+def save_revision_snapshot(jv_id, employee_no):
+
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    header = cursor.execute("""
+        SELECT
+            jv_number,
+            jv_type,
+            accounting_period,
+            remarks,
+            status,
+            total_debit,
+            total_credit,
+            prepared_by,
+            prepared_name,
+            submitted_at,
+            approved_by,
+            approved_name,
+            approved_at,
+            reviewer_comments,
+            posted_by,
+            posted_at,
+            attachment_names,
+            revision_no
+        FROM jv_headers
+        WHERE id = ?
+    """, (jv_id,)).fetchone()
+
+    if not header:
+        conn.close()
+        return
+
+    lines = cursor.execute("""
+        SELECT
+            line_no,
+            line_date,
+            gl_code,
+            gl_description,
+            description,
+            debit,
+            credit
+        FROM jv_lines
+        WHERE jv_id = ?
+        ORDER BY line_no
+    """, (jv_id,)).fetchall()
+
+    snapshot = {
+        "header": list(header),
+        "lines": [list(row) for row in lines]
+    }
+
+    cursor.execute("""
+        INSERT INTO jv_revisions (
+            jv_id,
+            revision_no,
+            snapshot_json,
+            created_by,
+            created_at
+        )
+        VALUES (?, ?, ?, ?, ?)
+    """, (
+        jv_id,
+        int(header[-1] or 1),
+        json.dumps(snapshot),
+        employee_no,
+        datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    ))
+
+    conn.commit()
+    conn.close()
+
+
+def validate_journal(journal_df):
+
+    errors = []
+
+    if journal_df is None or journal_df.empty:
+        return ["Minimum two journal lines required."], 0.0, 0.0
+
+    debit_series = pd.to_numeric(
+        journal_df["Dr"],
+        errors="coerce"
+    ).fillna(0)
+
+    credit_series = pd.to_numeric(
+        journal_df["Cr"],
+        errors="coerce"
+    ).fillna(0)
+
+    total_debit = round(float(debit_series.sum()), 2)
+    total_credit = round(float(credit_series.sum()), 2)
+
+    active_rows = []
+
+    for index, row in journal_df.iterrows():
+
+        debit = float(debit_series.loc[index])
+        credit = float(credit_series.loc[index])
+
+        has_data = (
+            pd.notna(row["Date"])
+            or pd.notna(row["A/C Code"])
+            or str(row["Description"]).strip() != ""
+            or debit > 0
+            or credit > 0
+        )
+
+        if has_data:
+            active_rows.append(index)
+
+    if len(active_rows) < 2:
+        errors.append("Minimum two journal lines required.")
+
+    for position, index in enumerate(active_rows, start=1):
+
+        row = journal_df.loc[index]
+        debit = float(debit_series.loc[index])
+        credit = float(credit_series.loc[index])
+
+        if pd.isna(row["Date"]):
+            errors.append(f"Line {position}: Date required.")
+
+        if pd.isna(row["A/C Code"]):
+            errors.append(f"Line {position}: A/C Code required.")
+
+        if str(row["Description"]).strip() == "":
+            errors.append(f"Line {position}: Description required.")
+
+        if debit > 0 and credit > 0:
+            errors.append(f"Line {position}: Enter Dr or Cr only.")
+
+        if debit == 0 and credit == 0:
+            errors.append(f"Line {position}: Amount required.")
+
+    if total_debit == 0:
+        errors.append("JV total cannot be zero.")
+
+    if total_debit != total_credit:
+        errors.append(
+            f"Dr RM{total_debit:,.2f} does not match "
+            f"Cr RM{total_credit:,.2f}."
+        )
+
+    return errors, total_debit, total_credit
+
+
+def update_and_resubmit_jv(
+    jv_id,
+    jv_type,
+    remarks,
+    journal_df,
+    total_debit,
+    total_credit,
+    uploaded_files,
+    employee_no,
+    employee_name
+):
+
+    conn = get_connection()
+
+    header = conn.execute("""
+        SELECT
+            jv_number,
+            prepared_by,
+            status,
+            attachment_names,
+            revision_no
+        FROM jv_headers
+        WHERE id = ?
+    """, (jv_id,)).fetchone()
+
+    conn.close()
+
+    if not header:
+        raise ValueError("JV not found.")
+
+    jv_number, prepared_by, status, attachment_names, revision_no = header
+
+    if prepared_by != employee_no:
+        raise PermissionError("Only the original preparer can amend this JV.")
+
+    if status != "AMENDMENT REQUIRED":
+        raise PermissionError("This JV is not available for amendment.")
+
+    # Retain the previous version internally before replacing the live record.
+    save_revision_snapshot(jv_id, employee_no)
+
+    try:
+        existing_attachments = json.loads(attachment_names or "[]")
+    except:
+        existing_attachments = []
+
+    if uploaded_files:
+        for uploaded_file in uploaded_files:
+            if uploaded_file.name not in existing_attachments:
+                existing_attachments.append(uploaded_file.name)
+
+    new_revision = int(revision_no or 1) + 1
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute(
+        "DELETE FROM jv_lines WHERE jv_id = ?",
+        (jv_id,)
+    )
+
+    cursor.execute("""
+        UPDATE jv_headers
+        SET
+            jv_type = ?,
+            remarks = ?,
+            status = 'RESUBMITTED',
+            total_debit = ?,
+            total_credit = ?,
+            submitted_at = ?,
+            approved_by = NULL,
+            approved_name = NULL,
+            approved_at = NULL,
+            attachment_names = ?,
+            revision_no = ?
+        WHERE id = ?
+    """, (
+        jv_type,
+        remarks,
+        total_debit,
+        total_credit,
+        now,
+        json.dumps(existing_attachments),
+        new_revision,
+        jv_id
+    ))
+
+    line_no = 1
+
+    for _, row in journal_df.iterrows():
+
+        debit = float(
+            pd.to_numeric(row["Dr"], errors="coerce")
+            if pd.notna(row["Dr"])
+            else 0
+        )
+
+        credit = float(
+            pd.to_numeric(row["Cr"], errors="coerce")
+            if pd.notna(row["Cr"])
+            else 0
+        )
+
+        has_data = (
+            pd.notna(row["Date"])
+            or pd.notna(row["A/C Code"])
+            or str(row["Description"]).strip() != ""
+            or debit > 0
+            or credit > 0
+        )
+
+        if not has_data:
+            continue
+
+        selected_gl = row["A/C Code"]
+        gl_code = ""
+        gl_description = ""
+
+        if pd.notna(selected_gl):
+            selected_gl = str(selected_gl)
+            gl_code = selected_gl.split(" - ", 1)[0]
+
+            if " - " in selected_gl:
+                gl_description = selected_gl.split(" - ", 1)[1]
+
+        line_date = row["Date"]
+
+        if hasattr(line_date, "strftime"):
+            line_date = line_date.strftime("%Y-%m-%d")
+
+        cursor.execute("""
+            INSERT INTO jv_lines (
+                jv_id,
+                line_no,
+                line_date,
+                gl_code,
+                gl_description,
+                description,
+                debit,
+                credit
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            jv_id,
+            line_no,
+            str(line_date),
+            gl_code,
+            gl_description,
+            str(row["Description"]),
+            debit,
+            credit
+        ))
+
+        line_no += 1
+
+    conn.commit()
+    conn.close()
+
+    add_audit_log(
+        jv_id,
+        jv_number,
+        "JV_RESUBMITTED",
+        employee_no,
+        employee_name,
+        "PREPARER",
+        f"Amended and resubmitted. Revision {new_revision}."
+    )
+
+    return new_revision
+
+
+def render_amendment_controls(jv_id, employee_no, employee_name):
+
+    if role != "PREPARER":
+        return
+
+    conn = get_connection()
+
+    header = conn.execute("""
+        SELECT
+            jv_number,
+            jv_type,
+            accounting_period,
+            remarks,
+            status,
+            prepared_by,
+            reviewer_comments,
+            revision_no
+        FROM jv_headers
+        WHERE id = ?
+    """, (jv_id,)).fetchone()
+
+    conn.close()
+
+    if not header:
+        return
+
+    (
+        jv_number,
+        current_type,
+        accounting_period,
+        current_remarks,
+        status,
+        prepared_by,
+        reviewer_comments,
+        revision_no
+    ) = header
+
+    if status != "AMENDMENT REQUIRED":
+        return
+
+    if prepared_by != employee_no:
+        return
+
+    st.divider()
+    st.warning("Amendment required")
+
+    if reviewer_comments:
+        st.write(f"**Reviewer comments:** {reviewer_comments}")
+
+    if st.session_state.amend_jv_id != jv_id:
+
+        if st.button(
+            "Amend JV",
+            type="primary",
+            key=f"start_amend_{jv_id}"
+        ):
+            st.session_state.amend_jv_id = jv_id
+            st.rerun()
+
+        return
+
+    st.subheader("Amend & Resubmit")
+
+    st.caption(
+        f"JV No. {jv_number} remains unchanged. "
+        f"Accounting month: {month_label(accounting_period)}. "
+        f"Current revision: {int(revision_no or 1)}"
+    )
+
+    type_options = [
+        "Depreciation",
+        "Payroll",
+        "AmIncome Placement",
+        "Bank",
+        "Accrual",
+        "Provision",
+        "Other"
+    ]
+
+    type_index = 0
+
+    if current_type in type_options:
+        type_index = type_options.index(current_type)
+
+    amended_type = st.selectbox(
+        "JV Type",
+        type_options,
+        index=type_index,
+        key=f"amend_type_{jv_id}"
+    )
+
+    amended_remarks = st.text_input(
+        "JV Description / Remarks",
+        value=current_remarks or "",
+        key=f"amend_remarks_{jv_id}"
+    )
+
+    edit_df = get_jv_lines_for_edit(jv_id)
+
+    amended_df = st.data_editor(
+        edit_df,
+        num_rows="dynamic",
+        hide_index=True,
+        use_container_width=True,
+        column_config={
+            "Date": st.column_config.DateColumn(
+                "Date",
+                format="DD/MM/YYYY"
+            ),
+            "A/C Code": st.column_config.SelectboxColumn(
+                "A/C Code",
+                options=GL_OPTIONS
+            ),
+            "Description": st.column_config.TextColumn(
+                "Description",
+                width="large"
+            ),
+            "Dr": st.column_config.NumberColumn(
+                "Dr",
+                min_value=0.00,
+                format="%.2f"
+            ),
+            "Cr": st.column_config.NumberColumn(
+                "Cr",
+                min_value=0.00,
+                format="%.2f"
+            )
+        },
+        key=f"amend_editor_{jv_id}"
+    )
+
+    amendment_files = st.file_uploader(
+        "Add Supporting Documents (Optional)",
+        type=[
+            "pdf",
+            "xlsx",
+            "xls",
+            "docx",
+            "jpg",
+            "jpeg",
+            "png"
+        ],
+        accept_multiple_files=True,
+        key=f"amend_files_{jv_id}"
+    )
+
+    errors, total_debit, total_credit = validate_journal(amended_df)
+
+    c1, c2, c3 = st.columns(3)
+
+    c1.metric("Total Dr", f"RM {total_debit:,.2f}")
+    c2.metric("Total Cr", f"RM {total_credit:,.2f}")
+    c3.metric(
+        "Difference",
+        f"RM {total_debit - total_credit:,.2f}"
+    )
+
+    if errors:
+
+        st.error("JV not ready for resubmission.")
+
+        with st.expander("Validation issues"):
+            for error in errors:
+                st.write(f"• {error}")
+
+        resubmit_disabled = True
+
+    else:
+        st.success("Balanced ✓")
+        resubmit_disabled = False
+
+    c1, c2 = st.columns(2)
+
+    with c1:
+        if st.button(
+            "Cancel Amendment",
+            use_container_width=True,
+            key=f"cancel_amend_{jv_id}"
+        ):
+            st.session_state.amend_jv_id = None
+            st.rerun()
+
+    with c2:
+        if st.button(
+            "Resubmit for Approval",
+            type="primary",
+            disabled=resubmit_disabled,
+            use_container_width=True,
+            key=f"resubmit_{jv_id}"
+        ):
+
+            new_revision = update_and_resubmit_jv(
+                jv_id,
+                amended_type,
+                amended_remarks,
+                amended_df,
+                total_debit,
+                total_credit,
+                amendment_files,
+                employee_no,
+                employee_name
+            )
+
+            st.session_state.amend_jv_id = None
+            st.session_state.myjv_jv_id = None
+            st.session_state.dashboard_jv_id = None
+
+            st.success(
+                f"{jv_number} resubmitted successfully "
+                f"as Revision {new_revision}."
+            )
+
+            st.rerun()
+
+
 def get_jv_lines(jv_id):
 
     conn = get_connection()
@@ -598,12 +1211,27 @@ def show_jv_detail(jv_id):
             f"{display_datetime(approved_at)}"
         )
 
-    if reviewer_comments:
+    if reviewer_comments and role != "AUDITOR":
 
         st.write(
             f"**Reviewer comments:** "
             f"{reviewer_comments}"
         )
+
+    if role != "AUDITOR":
+
+        conn = get_connection()
+        revision_row = conn.execute(
+            "SELECT revision_no FROM jv_headers WHERE id = ?",
+            (jv_id,)
+        ).fetchone()
+        conn.close()
+
+        if revision_row:
+            st.write(
+                f"**Current revision:** "
+                f"{int(revision_row[0] or 1)}"
+            )
 
     if posted_by:
 
@@ -700,7 +1328,8 @@ defaults = {
     "search_month": None,
     "search_jv_id": None,
 
-    "audit_month": None
+    "audit_month": None,
+    "amend_jv_id": None
 }
 
 for key, value in defaults.items():
@@ -744,7 +1373,8 @@ def reset_drilldowns():
         "approval_jv_id",
         "search_month",
         "search_jv_id",
-        "audit_month"
+        "audit_month",
+        "amend_jv_id"
     ]
 
     for key in keys:
@@ -1081,6 +1711,10 @@ if st.session_state.page == "Dashboard":
         total_count = conn.execute("""
             SELECT COUNT(*)
             FROM jv_headers
+            WHERE status IN (
+                'APPROVED',
+                'POSTED TO UBS'
+            )
         """).fetchone()[0]
 
         approved_count = conn.execute("""
@@ -1202,6 +1836,13 @@ if st.session_state.page == "Dashboard":
                 st.session_state.dashboard_jv_id
             )
 
+            if role == "PREPARER":
+                render_amendment_controls(
+                    st.session_state.dashboard_jv_id,
+                    employee_no,
+                    user_name
+                )
+
 
         # JV LIST
         elif st.session_state.dashboard_month:
@@ -1321,7 +1962,16 @@ if st.session_state.page == "Dashboard":
 
             elif role == "AUDITOR":
 
-                if selected_status == "APPROVED":
+                if selected_status == "ALL":
+
+                    query += """
+                        AND status IN (
+                            'APPROVED',
+                            'POSTED TO UBS'
+                        )
+                    """
+
+                elif selected_status == "APPROVED":
 
                     query += """
                         AND status = 'APPROVED'
@@ -1493,7 +2143,16 @@ if st.session_state.page == "Dashboard":
 
             elif role == "AUDITOR":
 
-                if selected_status == "APPROVED":
+                if selected_status == "ALL":
+
+                    query += """
+                        AND status IN (
+                            'APPROVED',
+                            'POSTED TO UBS'
+                        )
+                    """
+
+                elif selected_status == "APPROVED":
 
                     query += """
                         AND status = 'APPROVED'
@@ -1913,6 +2572,12 @@ elif st.session_state.page == "My JVs":
 
         show_jv_detail(
             st.session_state.myjv_jv_id
+        )
+
+        render_amendment_controls(
+            st.session_state.myjv_jv_id,
+            employee_no,
+            user_name
         )
 
 
@@ -2433,21 +3098,45 @@ elif st.session_state.page == "Search JVs":
 
         conn = get_connection()
 
-        rows = conn.execute("""
-            SELECT
-                id,
-                jv_number,
-                jv_type,
-                total_debit,
-                status,
-                prepared_name,
-                approved_name
-            FROM jv_headers
-            WHERE accounting_period = ?
-            ORDER BY id DESC
-        """, (
-            selected_month,
-        )).fetchall()
+        if role == "AUDITOR":
+
+            rows = conn.execute("""
+                SELECT
+                    id,
+                    jv_number,
+                    jv_type,
+                    total_debit,
+                    status,
+                    prepared_name,
+                    approved_name
+                FROM jv_headers
+                WHERE accounting_period = ?
+                AND status IN (
+                    'APPROVED',
+                    'POSTED TO UBS'
+                )
+                ORDER BY id DESC
+            """, (
+                selected_month,
+            )).fetchall()
+
+        else:
+
+            rows = conn.execute("""
+                SELECT
+                    id,
+                    jv_number,
+                    jv_type,
+                    total_debit,
+                    status,
+                    prepared_name,
+                    approved_name
+                FROM jv_headers
+                WHERE accounting_period = ?
+                ORDER BY id DESC
+            """, (
+                selected_month,
+            )).fetchall()
 
         conn.close()
 
@@ -2511,14 +3200,31 @@ elif st.session_state.page == "Search JVs":
 
         conn = get_connection()
 
-        month_rows = conn.execute("""
-            SELECT
-                accounting_period,
-                COUNT(*)
-            FROM jv_headers
-            GROUP BY accounting_period
-            ORDER BY accounting_period DESC
-        """).fetchall()
+        if role == "AUDITOR":
+
+            month_rows = conn.execute("""
+                SELECT
+                    accounting_period,
+                    COUNT(*)
+                FROM jv_headers
+                WHERE status IN (
+                    'APPROVED',
+                    'POSTED TO UBS'
+                )
+                GROUP BY accounting_period
+                ORDER BY accounting_period DESC
+            """).fetchall()
+
+        else:
+
+            month_rows = conn.execute("""
+                SELECT
+                    accounting_period,
+                    COUNT(*)
+                FROM jv_headers
+                GROUP BY accounting_period
+                ORDER BY accounting_period DESC
+            """).fetchall()
 
         conn.close()
 
@@ -2609,6 +3315,15 @@ elif st.session_state.page == "Audit Trail":
             JOIN jv_headers j
                 ON a.jv_id = j.id
             WHERE j.accounting_period = ?
+            AND j.status IN (
+                'APPROVED',
+                'POSTED TO UBS'
+            )
+            AND a.event_type IN (
+                'JV_SUBMITTED',
+                'JV_APPROVED',
+                'JV_POSTED_TO_UBS'
+            )
             ORDER BY a.id DESC
         """, conn, params=(
             selected_month,
@@ -2642,6 +3357,15 @@ elif st.session_state.page == "Audit Trail":
             FROM audit_log a
             JOIN jv_headers j
                 ON a.jv_id = j.id
+            WHERE j.status IN (
+                'APPROVED',
+                'POSTED TO UBS'
+            )
+            AND a.event_type IN (
+                'JV_SUBMITTED',
+                'JV_APPROVED',
+                'JV_POSTED_TO_UBS'
+            )
             GROUP BY j.accounting_period
             ORDER BY j.accounting_period DESC
         """).fetchall()
