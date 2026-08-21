@@ -184,6 +184,30 @@ def initialise_database():
         )
     """)
 
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS accounting_periods (
+            entity TEXT NOT NULL,
+            accounting_period TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'OPEN',
+            updated_by TEXT,
+            updated_at TEXT,
+            PRIMARY KEY (entity, accounting_period)
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS period_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            entity TEXT NOT NULL,
+            accounting_period TEXT NOT NULL,
+            old_status TEXT,
+            new_status TEXT NOT NULL,
+            changed_by TEXT NOT NULL,
+            changed_name TEXT NOT NULL,
+            changed_at TEXT NOT NULL
+        )
+    """)
+
     # Safe migration for databases created by an earlier prototype version.
     header_columns = [
         row[1]
@@ -245,6 +269,133 @@ def month_label(period_text):
     )
 
     return dt.strftime("%B %Y")
+
+
+
+def period_key(value):
+    """Return YYYY-MM from a date, datetime or existing period string."""
+    if isinstance(value, (date, datetime)):
+        return value.strftime("%Y-%m")
+
+    value = str(value)
+
+    if len(value) >= 7:
+        return value[:7]
+
+    return value
+
+
+def get_period_status(accounting_period, entity="JKPSD"):
+    """Periods are OPEN by default until Admin explicitly closes them."""
+    key = period_key(accounting_period)
+
+    conn = get_connection()
+    row = conn.execute("""
+        SELECT status
+        FROM accounting_periods
+        WHERE entity = ?
+        AND accounting_period = ?
+    """, (entity, key)).fetchone()
+    conn.close()
+
+    return row[0] if row else "OPEN"
+
+
+def is_period_open(accounting_period, entity="JKPSD"):
+    return get_period_status(accounting_period, entity) == "OPEN"
+
+
+def get_period_outstanding_count(accounting_period):
+    """Count JVs that are not yet finalised for the accounting month."""
+    key = period_key(accounting_period)
+
+    conn = get_connection()
+    count = conn.execute("""
+        SELECT COUNT(*)
+        FROM jv_headers
+        WHERE accounting_period = ?
+        AND status NOT IN (
+            'POSTED TO UBS',
+            'CANCELLED'
+        )
+    """, (key,)).fetchone()[0]
+    conn.close()
+
+    return count
+
+
+def set_period_status(
+    accounting_period,
+    new_status,
+    employee_no,
+    employee_name,
+    entity="JKPSD"
+):
+    key = period_key(accounting_period)
+    new_status = new_status.upper()
+
+    if new_status not in ("OPEN", "CLOSED"):
+        raise ValueError("Invalid accounting period status.")
+
+    if new_status == "CLOSED":
+        outstanding = get_period_outstanding_count(key)
+
+        if outstanding > 0:
+            raise PermissionError(
+                f"Period cannot be closed because {outstanding} JV(s) "
+                f"are not yet Posted to UBS or Cancelled."
+            )
+
+    old_status = get_period_status(key, entity)
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    conn = get_connection()
+
+    conn.execute("""
+        INSERT INTO accounting_periods (
+            entity,
+            accounting_period,
+            status,
+            updated_by,
+            updated_at
+        )
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(entity, accounting_period)
+        DO UPDATE SET
+            status = excluded.status,
+            updated_by = excluded.updated_by,
+            updated_at = excluded.updated_at
+    """, (
+        entity,
+        key,
+        new_status,
+        employee_no,
+        now
+    ))
+
+    conn.execute("""
+        INSERT INTO period_history (
+            entity,
+            accounting_period,
+            old_status,
+            new_status,
+            changed_by,
+            changed_name,
+            changed_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (
+        entity,
+        key,
+        old_status,
+        new_status,
+        employee_no,
+        employee_name,
+        now
+    ))
+
+    conn.commit()
+    conn.close()
 
 
 def add_audit_log(
@@ -700,6 +851,19 @@ def update_and_resubmit_jv(
 
     jv_number, prepared_by, status, attachment_names, revision_no = header
 
+    period_row_conn = get_connection()
+    period_row = period_row_conn.execute(
+        "SELECT accounting_period FROM jv_headers WHERE id = ?",
+        (jv_id,)
+    ).fetchone()
+    period_row_conn.close()
+
+    if period_row and not is_period_open(period_row[0]):
+        raise PermissionError(
+            f"{month_label(period_row[0])} is CLOSED. "
+            "This JV cannot be amended or resubmitted."
+        )
+
     if prepared_by != employee_no:
         raise PermissionError("Only the original preparer can amend this JV.")
 
@@ -881,6 +1045,14 @@ def render_amendment_controls(jv_id, employee_no, employee_name):
         return
 
     if prepared_by != employee_no:
+        return
+
+    if not is_period_open(accounting_period):
+        st.divider()
+        st.error(
+            f"{month_label(accounting_period)} is CLOSED. "
+            "Amendment and resubmission are locked."
+        )
         return
 
     st.divider()
@@ -1264,6 +1436,152 @@ def show_jv_detail(jv_id):
         st.caption(
             "No supporting documents attached."
         )
+
+
+
+def render_post_to_ubs_control(jv_id, employee_no, employee_name):
+    """Allow only the original preparer to mark an approved JV as posted."""
+    conn = get_connection()
+    row = conn.execute("""
+        SELECT
+            jv_number,
+            status,
+            prepared_by,
+            posted_by,
+            posted_at
+        FROM jv_headers
+        WHERE id = ?
+    """, (jv_id,)).fetchone()
+    conn.close()
+
+    if not row:
+        return
+
+    jv_number, status, prepared_by, posted_by, posted_at = row
+
+    # Segregation / ownership control: only the JV's preparer can post it.
+    if prepared_by != employee_no:
+        return
+
+    if status == "POSTED TO UBS":
+        st.success(
+            f"Finalised: {jv_number} was posted to UBS by "
+            f"{posted_by or employee_no} on {display_datetime(posted_at)}."
+        )
+        st.caption(
+            "This JV is locked. No further amendment or approval action is allowed."
+        )
+        return
+
+    if status != "APPROVED":
+        return
+
+    period_conn = get_connection()
+    period_row = period_conn.execute(
+        "SELECT accounting_period FROM jv_headers WHERE id = ?",
+        (jv_id,)
+    ).fetchone()
+    period_conn.close()
+
+    if period_row and not is_period_open(period_row[0]):
+        st.divider()
+        st.error(
+            f"{month_label(period_row[0])} is CLOSED. "
+            "UBS posting confirmation is locked."
+        )
+        return
+
+    st.divider()
+    st.subheader("UBS Posting")
+
+    st.info(
+        "After the approved JV has been manually posted into UBS, "
+        "confirm the posting here. This action finalises and locks the JV."
+    )
+
+    confirm = st.checkbox(
+        "I confirm that this approved JV has been posted into UBS.",
+        key=f"confirm_ubs_{jv_id}"
+    )
+
+    if st.button(
+        "Mark as Posted to UBS",
+        type="primary",
+        use_container_width=True,
+        disabled=not confirm,
+        key=f"post_ubs_{jv_id}"
+    ):
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        conn = get_connection()
+
+        # Re-check status at the moment of update to prevent an invalid transition.
+        current = conn.execute("""
+            SELECT status, prepared_by
+            FROM jv_headers
+            WHERE id = ?
+        """, (jv_id,)).fetchone()
+
+        if not current:
+            conn.close()
+            st.error("JV not found.")
+            return
+
+        current_status, current_preparer = current
+
+        if current_preparer != employee_no:
+            conn.close()
+            st.error("Only the JV preparer can confirm UBS posting.")
+            return
+
+        if current_status != "APPROVED":
+            conn.close()
+            st.error(
+                "Only an APPROVED JV can be marked as Posted to UBS."
+            )
+            return
+
+        cursor = conn.execute("""
+            UPDATE jv_headers
+            SET
+                status = 'POSTED TO UBS',
+                posted_by = ?,
+                posted_at = ?
+            WHERE id = ?
+            AND status = 'APPROVED'
+            AND prepared_by = ?
+        """, (
+            employee_no,
+            now,
+            jv_id,
+            employee_no
+        ))
+
+        conn.commit()
+        changed = cursor.rowcount
+        conn.close()
+
+        if changed != 1:
+            st.error(
+                "The JV status changed before posting could be recorded. "
+                "Please refresh and check the JV."
+            )
+            return
+
+        add_audit_log(
+            jv_id,
+            jv_number,
+            "JV_POSTED_TO_UBS",
+            employee_no,
+            employee_name,
+            "PREPARER",
+            "Approved JV manually posted to UBS and finalised."
+        )
+
+        st.success(
+            f"{jv_number} marked as Posted to UBS and locked."
+        )
+        st.rerun()
 
 
 def show_month_list(
@@ -1789,9 +2107,16 @@ if st.session_state.page == "Dashboard":
             len(GL_MASTER)
         )
 
+        configured_open_periods = conn.execute("""
+            SELECT COUNT(*)
+            FROM accounting_periods
+            WHERE entity = 'JKPSD'
+            AND status = 'OPEN'
+        """).fetchone()[0]
+
         c3.metric(
             "Open Periods",
-            0
+            configured_open_periods
         )
 
         c4.metric(
@@ -1835,6 +2160,13 @@ if st.session_state.page == "Dashboard":
             show_jv_detail(
                 st.session_state.dashboard_jv_id
             )
+
+            if role == "PREPARER":
+                render_post_to_ubs_control(
+                    st.session_state.dashboard_jv_id,
+                    employee_no,
+                    user_name
+                )
 
             if role == "PREPARER":
                 render_amendment_controls(
@@ -2248,6 +2580,10 @@ elif st.session_state.page == "Create New JV":
         accounting_period
     )
 
+    selected_period_status = get_period_status(
+        accounting_period
+    )
+
     with col2:
 
         st.markdown(
@@ -2278,6 +2614,16 @@ elif st.session_state.page == "Create New JV":
     remarks = st.text_input(
         "JV Description / Remarks"
     )
+
+    if selected_period_status == "CLOSED":
+        st.error(
+            f"{month_label(accounting_period.strftime('%Y-%m'))} is CLOSED. "
+            "New JVs cannot be submitted for this accounting month."
+        )
+    else:
+        st.caption(
+            f"Accounting period status: {selected_period_status}"
+        )
 
     st.divider()
 
@@ -2486,6 +2832,11 @@ elif st.session_state.page == "Create New JV":
             f"Cr RM{total_credit:,.2f}."
         )
 
+    if selected_period_status == "CLOSED":
+        errors.append(
+            "Submission is not allowed because the accounting period is CLOSED."
+        )
+
     if errors:
 
         st.error(
@@ -2575,6 +2926,12 @@ elif st.session_state.page == "My JVs":
         )
 
         render_amendment_controls(
+            st.session_state.myjv_jv_id,
+            employee_no,
+            user_name
+        )
+
+        render_post_to_ubs_control(
             st.session_state.myjv_jv_id,
             employee_no,
             user_name
@@ -2762,7 +3119,8 @@ elif st.session_state.page == "Approval Inbox":
         selected_row = conn.execute("""
             SELECT
                 jv_number,
-                prepared_by
+                prepared_by,
+                accounting_period
             FROM jv_headers
             WHERE id = ?
         """, (
@@ -2773,6 +3131,14 @@ elif st.session_state.page == "Approval Inbox":
 
         selected_jv_number = selected_row[0]
         preparer_no = selected_row[1]
+        selected_accounting_period = selected_row[2]
+        approval_period_open = is_period_open(selected_accounting_period)
+
+        if not approval_period_open:
+            st.error(
+                f"{month_label(selected_accounting_period)} is CLOSED. "
+                "Approval and return actions are locked."
+            )
 
         comments = st.text_area(
             "Reviewer Comments"
@@ -2787,7 +3153,13 @@ elif st.session_state.page == "Approval Inbox":
                 use_container_width=True
             ):
 
-                if not comments.strip():
+                if not approval_period_open:
+
+                    st.error(
+                        "This accounting period is CLOSED."
+                    )
+
+                elif not comments.strip():
 
                     st.error(
                         "Reviewer comments are required."
@@ -2845,7 +3217,13 @@ elif st.session_state.page == "Approval Inbox":
                 use_container_width=True
             ):
 
-                if preparer_no == employee_no:
+                if not approval_period_open:
+
+                    st.error(
+                        "This accounting period is CLOSED."
+                    )
+
+                elif preparer_no == employee_no:
 
                     st.error(
                         "Segregation of duties violation."
@@ -3623,47 +4001,178 @@ elif st.session_state.page == "Period Control":
         "Period Control"
     )
 
+    st.caption(
+        "Closing a month locks new JV submission, amendment, "
+        "resubmission, approval/return and UBS posting confirmation."
+    )
+
     year = st.selectbox(
         "Year",
         [
             2025,
             2026,
-            2027
+            2027,
+            2028,
+            2029,
+            2030
         ],
         index=1
     )
 
+    month_names = [
+        "January",
+        "February",
+        "March",
+        "April",
+        "May",
+        "June",
+        "July",
+        "August",
+        "September",
+        "October",
+        "November",
+        "December"
+    ]
+
     month = st.selectbox(
         "Month",
-        [
-            "January",
-            "February",
-            "March",
-            "April",
-            "May",
-            "June",
-            "July",
-            "August",
-            "September",
-            "October",
-            "November",
-            "December"
-        ]
+        month_names
     )
 
-    period_status = st.radio(
-        "Status",
+    month_no = month_names.index(month) + 1
+    selected_period = f"{year}-{month_no:02d}"
+    current_status = get_period_status(selected_period)
+    outstanding_count = get_period_outstanding_count(selected_period)
+
+    c1, c2 = st.columns(2)
+
+    c1.metric(
+        "Current Status",
+        current_status
+    )
+
+    c2.metric(
+        "JV Not Finalised",
+        outstanding_count
+    )
+
+    if outstanding_count > 0:
+        st.warning(
+            f"{outstanding_count} JV(s) are not yet Posted to UBS or Cancelled. "
+            "The month cannot be closed until they are finalised."
+        )
+    else:
+        st.success(
+            "No outstanding JV prevents period closing."
+        )
+
+    desired_status = st.radio(
+        "Set Period Status",
         [
             "OPEN",
             "CLOSED"
         ],
+        index=0 if current_status == "OPEN" else 1,
         horizontal=True
     )
 
     if st.button(
-        "Update Period"
+        "Update Period",
+        type="primary"
     ):
 
-        st.success(
-            f"{month} {year} set to {period_status}."
+        try:
+
+            set_period_status(
+                selected_period,
+                desired_status,
+                employee_no,
+                user_name
+            )
+
+            st.success(
+                f"{month} {year} set to {desired_status}."
+            )
+
+            st.rerun()
+
+        except PermissionError as exc:
+
+            st.error(
+                str(exc)
+            )
+
+    st.divider()
+    st.subheader(
+        "Configured Periods"
+    )
+
+    conn = get_connection()
+
+    period_df = pd.read_sql_query("""
+        SELECT
+            accounting_period AS "Period",
+            status AS "Status",
+            updated_by AS "Updated By",
+            updated_at AS "Updated At"
+        FROM accounting_periods
+        WHERE entity = 'JKPSD'
+        ORDER BY accounting_period DESC
+    """, conn)
+
+    history_df = pd.read_sql_query("""
+        SELECT
+            accounting_period AS "Period",
+            old_status AS "Previous",
+            new_status AS "New Status",
+            changed_by AS "Employee No.",
+            changed_name AS "Changed By",
+            changed_at AS "Changed At"
+        FROM period_history
+        WHERE entity = 'JKPSD'
+        ORDER BY id DESC
+        LIMIT 20
+    """, conn)
+
+    conn.close()
+
+    if period_df.empty:
+
+        st.info(
+            "No period status has been explicitly configured yet. "
+            "Unconfigured periods are treated as OPEN."
         )
+
+    else:
+
+        period_df["Period"] = period_df["Period"].apply(month_label)
+        period_df["Updated At"] = period_df["Updated At"].apply(display_datetime)
+
+        st.dataframe(
+            period_df,
+            use_container_width=True,
+            hide_index=True
+        )
+
+    with st.expander(
+        "Period Change History"
+    ):
+
+        if history_df.empty:
+
+            st.caption(
+                "No period changes recorded yet."
+            )
+
+        else:
+
+            history_df["Period"] = history_df["Period"].apply(month_label)
+            history_df["Changed At"] = history_df["Changed At"].apply(
+                display_datetime
+            )
+
+            st.dataframe(
+                history_df,
+                use_container_width=True,
+                hide_index=True
+            )
