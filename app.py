@@ -4176,3 +4176,4 @@ elif st.session_state.page == "Period Control":
                 use_container_width=True,
                 hide_index=True
             )
+
