@@ -2,6 +2,9 @@ import streamlit as st
 import pandas as pd
 import sqlite3
 import json
+import hashlib
+import os
+import secrets
 from datetime import datetime, date
 
 
@@ -20,7 +23,7 @@ st.set_page_config(
 # DEMO USERS
 # =========================================================
 
-USERS = {
+DEMO_USERS = {
     "1001": {
         "password": "prep123",
         "name": "Demo Preparer",
@@ -208,6 +211,42 @@ def initialise_database():
         )
     """)
 
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            employee_no TEXT PRIMARY KEY,
+            employee_name TEXT NOT NULL,
+            password_hash TEXT NOT NULL,
+            salt TEXT NOT NULL,
+            role TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'ACTIVE',
+            entity TEXT NOT NULL DEFAULT 'JKPSD',
+            created_at TEXT NOT NULL,
+            created_by TEXT,
+            deactivated_at TEXT,
+            deactivated_by TEXT
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS pic_requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            requested_by TEXT NOT NULL,
+            requested_by_name TEXT NOT NULL,
+            new_employee_no TEXT NOT NULL,
+            new_employee_name TEXT NOT NULL,
+            requested_role TEXT NOT NULL,
+            effective_date TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            comments TEXT,
+            status TEXT NOT NULL DEFAULT 'PENDING',
+            requested_at TEXT NOT NULL,
+            reviewed_by TEXT,
+            reviewed_by_name TEXT,
+            reviewed_at TEXT,
+            review_comments TEXT
+        )
+    """)
+
     # Safe migration for databases created by an earlier prototype version.
     header_columns = [
         row[1]
@@ -229,6 +268,140 @@ initialise_database()
 # =========================================================
 # HELPERS
 # =========================================================
+
+
+def hash_password(password, salt=None):
+    if salt is None:
+        salt = os.urandom(16).hex()
+    digest = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        bytes.fromhex(salt),
+        200_000
+    ).hex()
+    return digest, salt
+
+
+def verify_password(password, stored_hash, salt):
+    check_hash, _ = hash_password(password, salt)
+    return secrets.compare_digest(check_hash, stored_hash)
+
+
+def seed_demo_users():
+    conn = get_connection()
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    for employee_no, details in DEMO_USERS.items():
+        exists = conn.execute(
+            "SELECT 1 FROM users WHERE employee_no = ?",
+            (employee_no,)
+        ).fetchone()
+        if exists:
+            continue
+        password_hash, salt = hash_password(details["password"])
+        conn.execute("""
+            INSERT INTO users (
+                employee_no, employee_name, password_hash, salt,
+                role, status, entity, created_at, created_by
+            )
+            VALUES (?, ?, ?, ?, ?, 'ACTIVE', 'JKPSD', ?, 'SYSTEM')
+        """, (
+            employee_no,
+            details["name"],
+            password_hash,
+            salt,
+            details["role"],
+            now
+        ))
+    conn.commit()
+    conn.close()
+
+
+def get_user(employee_no):
+    conn = get_connection()
+    row = conn.execute("""
+        SELECT
+            employee_no, employee_name, password_hash, salt,
+            role, status, entity
+        FROM users
+        WHERE employee_no = ?
+    """, (employee_no,)).fetchone()
+    conn.close()
+    return row
+
+
+def create_user_account(employee_no, employee_name, role, temporary_password, created_by):
+    role = role.upper()
+    if role not in ("PREPARER", "APPROVER", "AUDITOR", "ADMIN"):
+        raise ValueError("Invalid user role.")
+    if not employee_no.strip():
+        raise ValueError("Employee Number is required.")
+    if not employee_name.strip():
+        raise ValueError("Employee Name is required.")
+    if len(temporary_password) < 8:
+        raise ValueError("Temporary password must contain at least 8 characters.")
+
+    conn = get_connection()
+    exists = conn.execute(
+        "SELECT 1 FROM users WHERE employee_no = ?",
+        (employee_no.strip(),)
+    ).fetchone()
+
+    if exists:
+        conn.close()
+        raise ValueError("Employee Number already exists.")
+
+    password_hash, salt = hash_password(temporary_password)
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    conn.execute("""
+        INSERT INTO users (
+            employee_no, employee_name, password_hash, salt,
+            role, status, entity, created_at, created_by
+        )
+        VALUES (?, ?, ?, ?, ?, 'ACTIVE', 'JKPSD', ?, ?)
+    """, (
+        employee_no.strip(),
+        employee_name.strip(),
+        password_hash,
+        salt,
+        role,
+        now,
+        created_by
+    ))
+    conn.commit()
+    conn.close()
+
+
+def set_user_status(employee_no, new_status, changed_by):
+    new_status = new_status.upper()
+    if new_status not in ("ACTIVE", "INACTIVE"):
+        raise ValueError("Invalid user status.")
+    if employee_no == changed_by and new_status == "INACTIVE":
+        raise PermissionError("Admin cannot deactivate their own active account.")
+
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    conn = get_connection()
+
+    if new_status == "ACTIVE":
+        conn.execute("""
+            UPDATE users
+            SET status = 'ACTIVE',
+                deactivated_at = NULL,
+                deactivated_by = NULL
+            WHERE employee_no = ?
+        """, (employee_no,))
+    else:
+        conn.execute("""
+            UPDATE users
+            SET status = 'INACTIVE',
+                deactivated_at = ?,
+                deactivated_by = ?
+            WHERE employee_no = ?
+        """, (now, changed_by, employee_no))
+
+    conn.commit()
+    conn.close()
+
 
 def display_date(value):
 
@@ -1661,21 +1834,31 @@ for key, value in defaults.items():
 # =========================================================
 
 def login(employee_no, password):
-
-    user = USERS.get(employee_no)
-
-    if user is None:
+    row = get_user(employee_no)
+    if not row:
         return False
 
-    if user["password"] != password:
+    (
+        db_employee_no,
+        employee_name,
+        password_hash,
+        salt,
+        user_role,
+        user_status,
+        entity
+    ) = row
+
+    if user_status != "ACTIVE":
+        return False
+
+    if not verify_password(password, password_hash, salt):
         return False
 
     st.session_state.logged_in = True
-    st.session_state.employee_no = employee_no
-    st.session_state.user_name = user["name"]
-    st.session_state.role = user["role"]
+    st.session_state.employee_no = db_employee_no
+    st.session_state.user_name = employee_name
+    st.session_state.role = user_role
     st.session_state.page = "Dashboard"
-
     return True
 
 
@@ -1710,6 +1893,9 @@ def logout():
     reset_drilldowns()
 
     st.rerun()
+
+
+seed_demo_users()
 
 
 # =========================================================
@@ -2097,9 +2283,15 @@ if st.session_state.page == "Dashboard":
 
         c1, c2, c3, c4 = st.columns(4)
 
+        active_user_count = conn.execute("""
+            SELECT COUNT(*)
+            FROM users
+            WHERE status = 'ACTIVE'
+        """).fetchone()[0]
+
         c1.metric(
             "Active Users",
-            4
+            active_user_count
         )
 
         c2.metric(
@@ -3787,46 +3979,28 @@ elif st.session_state.page == "Audit Trail":
 
 elif st.session_state.page == "New PIC Request":
 
-    if role not in [
-        "PREPARER",
-        "APPROVER"
-    ]:
-
-        st.error(
-            "Access denied."
-        )
-
+    if role not in ["PREPARER", "APPROVER"]:
+        st.error("Access denied.")
         st.stop()
 
-    st.header(
-        "New PIC / User Change Request"
+    st.header("New PIC / User Change Request")
+    st.caption(
+        "Submitting this request does not create access immediately. "
+        "Admin must review and approve the request."
     )
 
     c1, c2 = st.columns(2)
 
     with c1:
-
-        new_employee_no = st.text_input(
-            "New Employee Number"
-        )
-
-        new_employee_name = st.text_input(
-            "New Employee Name"
-        )
+        new_employee_no = st.text_input("New Employee Number")
+        new_employee_name = st.text_input("New Employee Name")
 
     with c2:
-
         requested_role = st.selectbox(
             "Requested Role",
-            [
-                "PREPARER",
-                "APPROVER"
-            ]
+            ["PREPARER", "APPROVER"]
         )
-
-        effective_date = st.date_input(
-            "Effective Date"
-        )
+        effective_date = st.date_input("Effective Date")
 
     reason = st.selectbox(
         "Reason",
@@ -3838,16 +4012,94 @@ elif st.session_state.page == "New PIC Request":
         ]
     )
 
-    comments = st.text_area(
-        "Comments"
-    )
+    comments = st.text_area("Comments")
 
-    if st.button(
-        "Submit PIC Request"
-    ):
+    if st.button("Submit PIC Request", type="primary"):
 
-        st.success(
-            "PIC request submitted for Admin review."
+        if not new_employee_no.strip():
+            st.error("New Employee Number is required.")
+
+        elif not new_employee_name.strip():
+            st.error("New Employee Name is required.")
+
+        else:
+            conn = get_connection()
+
+            duplicate_user = conn.execute(
+                "SELECT 1 FROM users WHERE employee_no = ?",
+                (new_employee_no.strip(),)
+            ).fetchone()
+
+            duplicate_request = conn.execute("""
+                SELECT 1
+                FROM pic_requests
+                WHERE new_employee_no = ?
+                AND status = 'PENDING'
+            """, (new_employee_no.strip(),)).fetchone()
+
+            if duplicate_user:
+                conn.close()
+                st.error("This Employee Number already has a user account.")
+
+            elif duplicate_request:
+                conn.close()
+                st.error("A pending PIC request already exists for this Employee Number.")
+
+            else:
+                conn.execute("""
+                    INSERT INTO pic_requests (
+                        requested_by, requested_by_name,
+                        new_employee_no, new_employee_name,
+                        requested_role, effective_date,
+                        reason, comments, status, requested_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?)
+                """, (
+                    employee_no,
+                    user_name,
+                    new_employee_no.strip(),
+                    new_employee_name.strip(),
+                    requested_role,
+                    effective_date.strftime("%Y-%m-%d"),
+                    reason,
+                    comments.strip(),
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                ))
+
+                conn.commit()
+                conn.close()
+                st.success("PIC request submitted for Admin review.")
+
+    st.divider()
+    st.subheader("My Requests")
+
+    conn = get_connection()
+    request_df = pd.read_sql_query("""
+        SELECT
+            new_employee_no AS "Employee No.",
+            new_employee_name AS "New PIC",
+            requested_role AS "Role",
+            effective_date AS "Effective Date",
+            reason AS "Reason",
+            status AS "Status",
+            requested_at AS "Requested At",
+            review_comments AS "Admin Comments"
+        FROM pic_requests
+        WHERE requested_by = ?
+        ORDER BY id DESC
+    """, conn, params=(employee_no,))
+    conn.close()
+
+    if request_df.empty:
+        st.caption("No PIC requests submitted yet.")
+    else:
+        request_df["Effective Date"] = request_df["Effective Date"].apply(display_date)
+        request_df["Requested At"] = request_df["Requested At"].apply(display_datetime)
+
+        st.dataframe(
+            request_df,
+            use_container_width=True,
+            hide_index=True
         )
 
 
@@ -3858,49 +4110,246 @@ elif st.session_state.page == "New PIC Request":
 elif st.session_state.page == "User Management":
 
     if role != "ADMIN":
-
-        st.error(
-            "Access denied."
-        )
-
+        st.error("Access denied.")
         st.stop()
 
-    st.header(
-        "User Management"
+    st.header("User Management")
+
+    tab1, tab2, tab3 = st.tabs(
+        ["PIC Requests", "User Master", "Create User"]
     )
 
-    user_df = pd.DataFrame([
-        {
-            "Employee No": "1001",
-            "Name": "Demo Preparer",
-            "Role": "PREPARER",
-            "Status": "ACTIVE"
-        },
-        {
-            "Employee No": "2001",
-            "Name": "Demo Assistant Manager",
-            "Role": "APPROVER",
-            "Status": "ACTIVE"
-        },
-        {
-            "Employee No": "9001",
-            "Name": "Demo Auditor",
-            "Role": "AUDITOR",
-            "Status": "ACTIVE"
-        },
-        {
-            "Employee No": "8001",
-            "Name": "Demo Admin",
-            "Role": "ADMIN",
-            "Status": "ACTIVE"
-        }
-    ])
+    with tab1:
+        conn = get_connection()
+        requests = conn.execute("""
+            SELECT
+                id, requested_by, requested_by_name,
+                new_employee_no, new_employee_name,
+                requested_role, effective_date,
+                reason, comments, requested_at
+            FROM pic_requests
+            WHERE status = 'PENDING'
+            ORDER BY id
+        """).fetchall()
+        conn.close()
 
-    st.dataframe(
-        user_df,
-        use_container_width=True,
-        hide_index=True
-    )
+        if not requests:
+            st.info("No pending PIC requests.")
+        else:
+            for request in requests:
+                (
+                    request_id,
+                    requested_by,
+                    requested_by_name,
+                    new_employee_no,
+                    new_employee_name,
+                    requested_role,
+                    effective_date,
+                    reason,
+                    request_comments,
+                    requested_at
+                ) = request
+
+                st.subheader(f"{new_employee_name} ({new_employee_no})")
+
+                c1, c2, c3 = st.columns(3)
+                c1.write(f"**Role:** {requested_role}")
+                c2.write(f"**Effective:** {display_date(effective_date)}")
+                c3.write(f"**Requested by:** {requested_by_name} ({requested_by})")
+
+                st.write(f"**Reason:** {reason}")
+                if request_comments:
+                    st.write(f"**Request comments:** {request_comments}")
+
+                temporary_password = st.text_input(
+                    "Temporary Password",
+                    type="password",
+                    key=f"temp_password_{request_id}",
+                    help="Minimum 8 characters."
+                )
+
+                admin_comment = st.text_input(
+                    "Admin Comment",
+                    key=f"admin_comment_{request_id}"
+                )
+
+                c1, c2 = st.columns(2)
+
+                with c1:
+                    if st.button(
+                        "Reject",
+                        key=f"reject_pic_{request_id}",
+                        use_container_width=True
+                    ):
+                        conn = get_connection()
+                        conn.execute("""
+                            UPDATE pic_requests
+                            SET status = 'REJECTED',
+                                reviewed_by = ?,
+                                reviewed_by_name = ?,
+                                reviewed_at = ?,
+                                review_comments = ?
+                            WHERE id = ?
+                            AND status = 'PENDING'
+                        """, (
+                            employee_no,
+                            user_name,
+                            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            admin_comment.strip(),
+                            request_id
+                        ))
+                        conn.commit()
+                        conn.close()
+                        st.success("PIC request rejected.")
+                        st.rerun()
+
+                with c2:
+                    if st.button(
+                        "Approve & Create Account",
+                        type="primary",
+                        key=f"approve_pic_{request_id}",
+                        use_container_width=True
+                    ):
+                        try:
+                            create_user_account(
+                                new_employee_no,
+                                new_employee_name,
+                                requested_role,
+                                temporary_password,
+                                employee_no
+                            )
+
+                            conn = get_connection()
+                            conn.execute("""
+                                UPDATE pic_requests
+                                SET status = 'APPROVED',
+                                    reviewed_by = ?,
+                                    reviewed_by_name = ?,
+                                    reviewed_at = ?,
+                                    review_comments = ?
+                                WHERE id = ?
+                                AND status = 'PENDING'
+                            """, (
+                                employee_no,
+                                user_name,
+                                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                admin_comment.strip(),
+                                request_id
+                            ))
+                            conn.commit()
+                            conn.close()
+
+                            st.success(
+                                f"Account {new_employee_no} created and activated."
+                            )
+                            st.rerun()
+
+                        except Exception as exc:
+                            st.error(str(exc))
+
+                st.divider()
+
+    with tab2:
+        conn = get_connection()
+        user_df = pd.read_sql_query("""
+            SELECT
+                employee_no AS "Employee No.",
+                employee_name AS "Name",
+                role AS "Role",
+                status AS "Status",
+                entity AS "Entity",
+                created_at AS "Created At",
+                created_by AS "Created By"
+            FROM users
+            ORDER BY
+                CASE status
+                    WHEN 'ACTIVE' THEN 0
+                    ELSE 1
+                END,
+                employee_name
+        """, conn)
+        conn.close()
+
+        if not user_df.empty:
+            user_df["Created At"] = user_df["Created At"].apply(display_datetime)
+
+        st.dataframe(
+            user_df,
+            use_container_width=True,
+            hide_index=True
+        )
+
+        if not user_df.empty:
+            selected_employee = st.selectbox(
+                "Select User",
+                user_df["Employee No."].tolist()
+            )
+
+            selected_status = user_df.loc[
+                user_df["Employee No."] == selected_employee,
+                "Status"
+            ].iloc[0]
+
+            if selected_status == "ACTIVE":
+                if st.button("Deactivate Selected User"):
+                    try:
+                        set_user_status(
+                            selected_employee,
+                            "INACTIVE",
+                            employee_no
+                        )
+                        st.success(f"{selected_employee} deactivated.")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(str(exc))
+            else:
+                if st.button("Reactivate Selected User"):
+                    set_user_status(
+                        selected_employee,
+                        "ACTIVE",
+                        employee_no
+                    )
+                    st.success(f"{selected_employee} reactivated.")
+                    st.rerun()
+
+    with tab3:
+        st.caption(
+            "For exceptional cases only. Normal Preparer/Approver replacement "
+            "should use the PIC Request workflow."
+        )
+
+        new_no = st.text_input(
+            "Employee Number",
+            key="admin_new_employee_no"
+        )
+        new_name = st.text_input(
+            "Employee Name",
+            key="admin_new_employee_name"
+        )
+        new_role = st.selectbox(
+            "Role",
+            ["PREPARER", "APPROVER", "AUDITOR", "ADMIN"],
+            key="admin_new_role"
+        )
+        new_password = st.text_input(
+            "Temporary Password",
+            type="password",
+            key="admin_new_password"
+        )
+
+        if st.button("Create User Account", type="primary"):
+            try:
+                create_user_account(
+                    new_no,
+                    new_name,
+                    new_role,
+                    new_password,
+                    employee_no
+                )
+                st.success(f"User {new_no} created.")
+                st.rerun()
+            except Exception as exc:
+                st.error(str(exc))
 
 
 elif st.session_state.page == "G/L Master":
