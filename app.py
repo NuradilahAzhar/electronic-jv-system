@@ -5,6 +5,9 @@ import json
 import hashlib
 import os
 import secrets
+import uuid
+import mimetypes
+from pathlib import Path
 from datetime import datetime, date
 
 
@@ -106,6 +109,11 @@ GL_OPTIONS = [
 # =========================================================
 
 DB_FILE = "ejv_demo.db"
+
+# Prototype attachment storage.
+# On Streamlit Community Cloud this local folder is NOT guaranteed permanent.
+ATTACHMENT_ROOT = Path("attachment_store")
+ATTACHMENT_ROOT.mkdir(parents=True, exist_ok=True)
 
 
 def get_connection():
@@ -244,6 +252,26 @@ def initialise_database():
             reviewed_by_name TEXT,
             reviewed_at TEXT,
             review_comments TEXT
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS jv_attachments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            jv_id INTEGER NOT NULL,
+            jv_number TEXT NOT NULL,
+            original_filename TEXT NOT NULL,
+            stored_filename TEXT NOT NULL,
+            stored_path TEXT NOT NULL,
+            mime_type TEXT,
+            file_size INTEGER NOT NULL,
+            sha256_hash TEXT NOT NULL,
+            revision_no INTEGER NOT NULL DEFAULT 1,
+            uploaded_by TEXT NOT NULL,
+            uploaded_name TEXT NOT NULL,
+            uploaded_at TEXT NOT NULL,
+            is_active INTEGER NOT NULL DEFAULT 1,
+            FOREIGN KEY(jv_id) REFERENCES jv_headers(id)
         )
     """)
 
@@ -402,6 +430,223 @@ def set_user_status(employee_no, new_status, changed_by):
     conn.commit()
     conn.close()
 
+
+
+def safe_extension(filename):
+    suffix = Path(filename).suffix.lower()
+    if len(suffix) > 10:
+        return ""
+    return suffix
+
+
+def store_uploaded_files(
+    jv_id,
+    jv_number,
+    uploaded_files,
+    revision_no,
+    employee_no,
+    employee_name
+):
+    """Save uploaded file bytes and register controlled metadata."""
+    if not uploaded_files:
+        return []
+
+    jv_folder = ATTACHMENT_ROOT / jv_number
+    jv_folder.mkdir(parents=True, exist_ok=True)
+
+    saved_names = []
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    conn = get_connection()
+
+    for uploaded_file in uploaded_files:
+        original_name = Path(uploaded_file.name).name
+        file_bytes = uploaded_file.getvalue()
+
+        if not file_bytes:
+            continue
+
+        # A replacement with the same visible filename becomes the active copy.
+        conn.execute("""
+            UPDATE jv_attachments
+            SET is_active = 0
+            WHERE jv_id = ?
+            AND original_filename = ?
+            AND is_active = 1
+        """, (
+            jv_id,
+            original_name
+        ))
+
+        stored_filename = (
+            f"{uuid.uuid4().hex}"
+            f"{safe_extension(original_name)}"
+        )
+
+        stored_path = jv_folder / stored_filename
+        stored_path.write_bytes(file_bytes)
+
+        sha256_hash = hashlib.sha256(file_bytes).hexdigest()
+
+        mime_type = (
+            getattr(uploaded_file, "type", None)
+            or mimetypes.guess_type(original_name)[0]
+            or "application/octet-stream"
+        )
+
+        conn.execute("""
+            INSERT INTO jv_attachments (
+                jv_id,
+                jv_number,
+                original_filename,
+                stored_filename,
+                stored_path,
+                mime_type,
+                file_size,
+                sha256_hash,
+                revision_no,
+                uploaded_by,
+                uploaded_name,
+                uploaded_at,
+                is_active
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+        """, (
+            jv_id,
+            jv_number,
+            original_name,
+            stored_filename,
+            str(stored_path),
+            mime_type,
+            len(file_bytes),
+            sha256_hash,
+            int(revision_no or 1),
+            employee_no,
+            employee_name,
+            now
+        ))
+
+        saved_names.append(original_name)
+
+    conn.commit()
+    conn.close()
+
+    return saved_names
+
+
+def get_active_attachments(jv_id):
+    conn = get_connection()
+
+    rows = conn.execute("""
+        SELECT
+            id,
+            original_filename,
+            stored_path,
+            mime_type,
+            file_size,
+            sha256_hash,
+            revision_no,
+            uploaded_by,
+            uploaded_name,
+            uploaded_at
+        FROM jv_attachments
+        WHERE jv_id = ?
+        AND is_active = 1
+        ORDER BY id
+    """, (
+        jv_id,
+    )).fetchall()
+
+    conn.close()
+    return rows
+
+
+def format_file_size(file_size):
+    file_size = int(file_size or 0)
+
+    if file_size < 1024:
+        return f"{file_size} B"
+
+    if file_size < 1024 * 1024:
+        return f"{file_size / 1024:,.1f} KB"
+
+    return f"{file_size / (1024 * 1024):,.1f} MB"
+
+
+def render_attachments(jv_id, status, legacy_attachment_names=None):
+    """Render only the current active supporting documents."""
+    attachments = get_active_attachments(jv_id)
+
+    # Auditor/Guest should only receive final/latest supporting documents.
+    if role == "AUDITOR" and status not in ("APPROVED", "POSTED TO UBS"):
+        return
+
+    st.divider()
+    st.subheader("Supporting Documents")
+
+    if not attachments:
+        # Existing prototype JVs may pre-date real attachment storage.
+        try:
+            legacy_names = json.loads(legacy_attachment_names or "[]")
+        except:
+            legacy_names = []
+
+        if legacy_names:
+            st.warning(
+                "These files were uploaded before document storage was enabled. "
+                "Only the filenames were retained in the earlier prototype."
+            )
+            for name in legacy_names:
+                st.write(f"• {name}")
+        else:
+            st.caption("No supporting documents attached.")
+        return
+
+    for attachment in attachments:
+        (
+            attachment_id,
+            original_filename,
+            stored_path,
+            mime_type,
+            file_size,
+            sha256_hash,
+            revision_no,
+            uploaded_by,
+            uploaded_name,
+            uploaded_at
+        ) = attachment
+
+        c1, c2 = st.columns([4, 1])
+
+        with c1:
+            st.write(f"**{original_filename}**")
+            st.caption(
+                f"{format_file_size(file_size)} | "
+                f"Uploaded by {uploaded_name} ({uploaded_by}) | "
+                f"{display_datetime(uploaded_at)}"
+            )
+
+            # Hide revision detail from Auditor to keep Guest view simple.
+            if role != "AUDITOR":
+                st.caption(
+                    f"Revision {revision_no} | "
+                    f"SHA-256: {sha256_hash[:16]}..."
+                )
+
+        with c2:
+            path = Path(stored_path)
+
+            if path.exists():
+                st.download_button(
+                    "Open / Download",
+                    data=path.read_bytes(),
+                    file_name=original_filename,
+                    mime=mime_type or "application/octet-stream",
+                    key=f"download_attachment_{attachment_id}",
+                    use_container_width=True
+                )
+            else:
+                st.error("File unavailable")
 
 def display_date(value):
 
@@ -777,6 +1022,15 @@ def save_jv(
 
     conn.commit()
     conn.close()
+
+    store_uploaded_files(
+        jv_id,
+        jv_number,
+        uploaded_files,
+        1,
+        employee_no,
+        employee_name
+    )
 
     add_audit_log(
         jv_id,
@@ -1164,6 +1418,15 @@ def update_and_resubmit_jv(
     conn.commit()
     conn.close()
 
+    store_uploaded_files(
+        jv_id,
+        jv_number,
+        uploaded_files,
+        new_revision,
+        employee_no,
+        employee_name
+    )
+
     add_audit_log(
         jv_id,
         jv_number,
@@ -1329,6 +1592,11 @@ def render_amendment_controls(jv_id, employee_no, employee_name):
         ],
         accept_multiple_files=True,
         key=f"amend_files_{jv_id}"
+    )
+
+    st.caption(
+        "A file with the same filename will replace the current active copy. "
+        "The previous copy remains retained internally."
     )
 
     errors, total_debit, total_credit = validate_journal(amended_df)
@@ -1590,25 +1858,11 @@ def show_jv_detail(jv_id):
             f"{display_datetime(posted_at)}"
         )
 
-    try:
-        attachments = json.loads(
-            attachment_names or "[]"
-        )
-    except:
-        attachments = []
-
-    if attachments:
-
-        st.write(
-            "**Attachments:** "
-            + ", ".join(attachments)
-        )
-
-    else:
-
-        st.caption(
-            "No supporting documents attached."
-        )
+    render_attachments(
+        jv_id,
+        status,
+        attachment_names
+    )
 
 
 
@@ -2932,6 +3186,11 @@ elif st.session_state.page == "Create New JV":
             "png"
         ],
         accept_multiple_files=True
+    )
+
+    st.caption(
+        "Files uploaded here will be linked to this JV. "
+        "Multiple documents are allowed."
     )
 
     errors = []
