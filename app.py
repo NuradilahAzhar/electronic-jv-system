@@ -3888,7 +3888,7 @@ if not st.session_state.logged_in:
     )
 
     st.caption(
-        "JKPSD Pilot"
+        "JKPSD | Electronic JV Workflow"
     )
 
     employee_no = st.text_input(
@@ -3952,8 +3952,8 @@ with st.sidebar:
 
         menu_options = [
             "Dashboard",
-            "Create New JV",
-            "Monthly Submission",
+            "Create / Save JV",
+            "Monthly Workspace",
             "My JVs",
             "Notifications",
             "New PIC Request"
@@ -4027,7 +4027,7 @@ st.title(
 )
 
 st.caption(
-    "JKPSD Pilot"
+    "JKPSD | Electronic JV Workflow"
 )
 
 st.divider()
@@ -4053,7 +4053,16 @@ if st.session_state.page == "Dashboard":
             SELECT COUNT(*)
             FROM jv_headers
             WHERE prepared_by = ?
-            AND status IN ('DRAFT', 'READY')
+            AND status = 'DRAFT'
+        """, (
+            employee_no,
+        )).fetchone()[0]
+
+        ready_count = conn.execute("""
+            SELECT COUNT(*)
+            FROM jv_headers
+            WHERE prepared_by = ?
+            AND status = 'READY'
         """, (
             employee_no,
         )).fetchone()[0]
@@ -4091,47 +4100,53 @@ if st.session_state.page == "Dashboard":
             employee_no,
         )).fetchone()[0]
 
-        c1, c2, c3, c4 = st.columns(4)
+        c1, c2, c3, c4, c5 = st.columns(5)
 
         with c1:
-
             if st.button(
-                f"Working JVs\n\n{draft_count}",
+                f"Draft\n\n{draft_count}",
                 use_container_width=True
             ):
-
                 st.session_state.dashboard_status = "DRAFT"
                 st.rerun()
 
         with c2:
+            if st.button(
+                f"Ready\n\n{ready_count}",
+                use_container_width=True
+            ):
+                st.session_state.dashboard_status = "READY"
+                st.rerun()
 
+        with c3:
             if st.button(
                 f"Pending Approval\n\n{pending_count}",
                 use_container_width=True
             ):
-
                 st.session_state.dashboard_status = "PENDING"
                 st.rerun()
 
-        with c3:
-
+        with c4:
             if st.button(
                 f"Amendment Required\n\n{amendment_count}",
                 use_container_width=True
             ):
-
                 st.session_state.dashboard_status = "AMENDMENT"
                 st.rerun()
 
-        with c4:
-
+        with c5:
             if st.button(
                 f"Approved\n\n{approved_count}",
                 use_container_width=True
             ):
-
                 st.session_state.dashboard_status = "APPROVED"
                 st.rerun()
+
+
+        st.caption(
+            "Workflow: Save individual JVs → complete all JVs to READY → "
+            "submit the accounting month once from Monthly Workspace."
+        )
 
 
     # APPROVER
@@ -4749,7 +4764,7 @@ if st.session_state.page == "Dashboard":
 # CREATE NEW JV
 # =========================================================
 
-elif st.session_state.page == "Create New JV":
+elif st.session_state.page == "Create / Save JV":
 
     if role != "PREPARER":
 
@@ -4758,6 +4773,12 @@ elif st.session_state.page == "Create New JV":
         )
 
         st.stop()
+
+    st.header("Create / Save JV")
+    st.caption(
+        "Prepare an individual JV and save it to the monthly workspace. "
+        "You do not need to submit each JV separately."
+    )
 
     col1, col2 = st.columns(
         [3, 1]
@@ -5137,16 +5158,16 @@ elif st.session_state.page == "Create New JV":
 # PREPARER - MONTHLY SUBMISSION
 # =========================================================
 
-elif st.session_state.page == "Monthly Submission":
+elif st.session_state.page == "Monthly Workspace":
 
     if role != "PREPARER":
         st.error("Access denied.")
         st.stop()
 
-    st.header("Monthly JV Submission")
+    st.header("Monthly JV Workspace")
     st.caption(
-        "Prepare and save individual JVs during the month. "
-        "When every JV is READY, submit the whole month once."
+        "Track all JVs by accounting month. Complete each JV until READY, "
+        "then submit the entire month to the Approver in one action."
     )
 
     if st.session_state.monthly_month:
@@ -5174,6 +5195,7 @@ elif st.session_state.page == "Monthly Submission":
             SELECT id,jv_number,jv_type,total_debit,status
             FROM jv_headers
             WHERE prepared_by=? AND accounting_period=?
+            AND status != 'CANCELLED'
             ORDER BY id
         """, (employee_no,selected_month)).fetchall()
         conn.close()
@@ -5209,7 +5231,7 @@ elif st.session_state.page == "Monthly Submission":
         else:
             st.success(f"All {ready_count} active JV(s) are READY for monthly submission.")
             confirm_month = st.checkbox(
-                f"I confirm that all JVs for {month_label(selected_month)} are complete.",
+                f"I confirm the JV set for {month_label(selected_month)} is complete and ready for approval.",
                 key=f"confirm_month_{selected_month}"
             )
             if st.button(
