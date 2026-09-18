@@ -347,6 +347,17 @@ def initialise_database():
         )
     """)
 
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS monthly_submissions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            accounting_period TEXT NOT NULL,
+            submitted_by TEXT NOT NULL,
+            submitted_name TEXT NOT NULL,
+            jv_count INTEGER NOT NULL,
+            submitted_at TEXT NOT NULL
+        )
+    """)
+
     # Safe migration for databases created by an earlier prototype version.
     header_columns = [
         row[1]
@@ -2220,7 +2231,7 @@ def submit_existing_draft(
             status = 'PENDING APPROVAL',
             submitted_at = ?
         WHERE id = ?
-        AND status = 'DRAFT'
+        AND status IN ('DRAFT', 'READY')
     """, (
         now,
         jv_id
@@ -2309,74 +2320,43 @@ def render_draft_controls(jv_id, employee_no, employee_name):
         return
 
     conn = get_connection()
-
     header = conn.execute("""
-        SELECT
-            jv_number,
-            jv_type,
-            accounting_period,
-            remarks,
-            status,
-            prepared_by
-        FROM jv_headers
-        WHERE id = ?
-    """, (
-        jv_id,
-    )).fetchone()
-
+        SELECT jv_number,jv_type,accounting_period,remarks,status,prepared_by
+        FROM jv_headers WHERE id = ?
+    """, (jv_id,)).fetchone()
     conn.close()
 
     if not header:
         return
 
-    (
-        jv_number,
-        current_type,
-        accounting_period,
-        current_remarks,
-        status,
-        prepared_by
-    ) = header
+    jv_number,current_type,accounting_period,current_remarks,status,prepared_by = header
 
-    if status != "DRAFT" or prepared_by != employee_no:
+    if status not in ("DRAFT", "READY") or prepared_by != employee_no:
         return
 
     st.divider()
-    st.subheader("Continue Draft")
+    st.subheader("Edit Working JV")
 
     if not is_period_open(accounting_period):
-        st.error(
-            f"{month_label(accounting_period)} is CLOSED. "
-            "This Draft is locked."
-        )
+        st.error(f"{month_label(accounting_period)} is CLOSED. This JV is locked.")
         return
 
-    type_options = get_jv_type_options(
-        include_inactive=True
-    )
+    if month_has_been_submitted(accounting_period, employee_no):
+        st.error("This month has already been submitted for approval.")
+        return
 
-    current_label = current_type
-
-    if not jv_type_is_active(current_type):
-        current_label = f"{current_type} [INACTIVE]"
-
+    type_options = get_jv_type_options(include_inactive=True)
+    current_label = current_type if jv_type_is_active(current_type) else f"{current_type} [INACTIVE]"
     if current_label not in type_options:
         type_options.insert(0, current_label)
 
     selected_type_display = st.selectbox(
-        "JV Type",
-        type_options,
+        "JV Type", type_options,
         index=type_options.index(current_label),
         key=f"draft_type_{jv_id}"
     )
-
-    selected_type = clean_jv_type_label(
-        selected_type_display
-    )
-
-    type_rule = get_jv_type_rule(
-        selected_type
-    )
+    selected_type = clean_jv_type_label(selected_type_display)
+    type_rule = get_jv_type_rule(selected_type)
 
     draft_remarks = st.text_input(
         "JV Description / Remarks",
@@ -2385,23 +2365,10 @@ def render_draft_controls(jv_id, employee_no, employee_name):
     )
 
     edit_df = get_jv_lines_for_edit(jv_id)
-
     if edit_df.empty:
         edit_df = pd.DataFrame([
-            {
-                "Date": None,
-                "A/C Code": None,
-                "Description": "",
-                "Dr": 0.00,
-                "Cr": 0.00
-            },
-            {
-                "Date": None,
-                "A/C Code": None,
-                "Description": "",
-                "Dr": 0.00,
-                "Cr": 0.00
-            }
+            {"Date":None,"A/C Code":None,"Description":"","Dr":0.0,"Cr":0.0},
+            {"Date":None,"A/C Code":None,"Description":"","Dr":0.0,"Cr":0.0}
         ])
 
     draft_df = st.data_editor(
@@ -2410,82 +2377,34 @@ def render_draft_controls(jv_id, employee_no, employee_name):
         hide_index=True,
         use_container_width=True,
         column_config={
-            "Date": st.column_config.DateColumn(
-                "Date",
-                format="DD/MM/YYYY"
-            ),
+            "Date": st.column_config.DateColumn("Date", format="DD/MM/YYYY"),
             "A/C Code": st.column_config.SelectboxColumn(
-                "A/C Code",
-                options=get_gl_options(include_inactive=True)
+                "A/C Code", options=get_gl_options(include_inactive=True)
             ),
-            "Description": st.column_config.TextColumn(
-                "Description",
-                width="large"
-            ),
-            "Dr": st.column_config.NumberColumn(
-                "Dr",
-                min_value=0.00,
-                format="%.2f"
-            ),
-            "Cr": st.column_config.NumberColumn(
-                "Cr",
-                min_value=0.00,
-                format="%.2f"
-            )
+            "Description": st.column_config.TextColumn("Description", width="large"),
+            "Dr": st.column_config.NumberColumn("Dr", min_value=0.00, format="%.2f"),
+            "Cr": st.column_config.NumberColumn("Cr", min_value=0.00, format="%.2f")
         },
         key=f"draft_editor_{jv_id}"
     )
 
     draft_files = st.file_uploader(
         "Add Supporting Documents",
-        type=[
-            "pdf",
-            "xlsx",
-            "xls",
-            "docx",
-            "jpg",
-            "jpeg",
-            "png"
-        ],
+        type=["pdf","xlsx","xls","docx","jpg","jpeg","png"],
         accept_multiple_files=True,
         key=f"draft_files_{jv_id}"
     )
 
-    debit_series = pd.to_numeric(
-        draft_df["Dr"],
-        errors="coerce"
-    ).fillna(0)
+    debit_series = pd.to_numeric(draft_df["Dr"], errors="coerce").fillna(0)
+    credit_series = pd.to_numeric(draft_df["Cr"], errors="coerce").fillna(0)
+    total_debit = round(float(debit_series.sum()),2)
+    total_credit = round(float(credit_series.sum()),2)
 
-    credit_series = pd.to_numeric(
-        draft_df["Cr"],
-        errors="coerce"
-    ).fillna(0)
-
-    total_debit = round(
-        float(debit_series.sum()),
-        2
-    )
-
-    total_credit = round(
-        float(credit_series.sum()),
-        2
-    )
-
-    submit_errors, _, _ = validate_journal(
-        draft_df
-    )
-
-    submit_errors.extend(
-        validate_journal_dates_against_period(
-            draft_df,
-            accounting_period
-        )
-    )
+    errors, _, _ = validate_journal(draft_df)
+    errors.extend(validate_journal_dates_against_period(draft_df, accounting_period))
 
     if not jv_type_is_active(selected_type):
-        submit_errors.append(
-            "Selected JV Type is inactive or invalid."
-        )
+        errors.append("Selected JV Type is inactive or invalid.")
 
     if (
         type_rule
@@ -2493,115 +2412,59 @@ def render_draft_controls(jv_id, employee_no, employee_name):
         and not get_active_attachments(jv_id)
         and not draft_files
     ):
-        submit_errors.append(
-            f"Supporting document is required for JV Type: {selected_type}."
-        )
+        errors.append(f"Supporting document is required for JV Type: {selected_type}.")
 
-    c1, c2, c3 = st.columns(3)
+    c1,c2,c3 = st.columns(3)
+    c1.metric("Total Dr", f"RM {total_debit:,.2f}")
+    c2.metric("Total Cr", f"RM {total_credit:,.2f}")
+    c3.metric("Difference", f"RM {total_debit-total_credit:,.2f}")
 
-    c1.metric(
-        "Total Dr",
-        f"RM {total_debit:,.2f}"
-    )
-
-    c2.metric(
-        "Total Cr",
-        f"RM {total_credit:,.2f}"
-    )
-
-    c3.metric(
-        "Difference",
-        f"RM {total_debit-total_credit:,.2f}"
-    )
-
-    if submit_errors:
-        with st.expander(
-            "Submission validation"
-        ):
-            for error in submit_errors:
+    ready_for_month = not errors
+    if errors:
+        st.warning("This JV will remain DRAFT until all validation issues are cleared.")
+        with st.expander("Validation issues"):
+            for error in errors:
                 st.write(f"• {error}")
     else:
-        st.success(
-            "Ready for submission ✓"
-        )
+        st.success("READY for monthly submission ✓")
 
-    c1, c2, c3 = st.columns(3)
-
+    c1,c2 = st.columns(2)
     with c1:
         if st.button(
-            "Save Draft Changes",
+            "Save JV Changes",
+            type="primary",
             use_container_width=True,
-            key=f"save_draft_changes_{jv_id}"
+            key=f"save_working_jv_{jv_id}"
         ):
-            update_existing_draft(
-                jv_id,
-                selected_type,
-                draft_remarks,
-                draft_df,
-                total_debit,
-                total_credit,
-                draft_files,
-                employee_no,
-                employee_name
+            new_status = update_working_jv(
+                jv_id,selected_type,draft_remarks,draft_df,
+                total_debit,total_credit,draft_files,
+                employee_no,employee_name,ready_for_month
             )
-
-            st.success(
-                f"{jv_number} draft updated."
-            )
+            st.success(f"{jv_number} saved with status {new_status}.")
             st.rerun()
 
     with c2:
-        if st.button(
-            "Submit for Approval",
-            type="primary",
-            use_container_width=True,
-            disabled=bool(submit_errors),
-            key=f"submit_draft_{jv_id}"
-        ):
-            submit_existing_draft(
-                jv_id,
-                selected_type,
-                draft_remarks,
-                draft_df,
-                total_debit,
-                total_credit,
-                draft_files,
-                employee_no,
-                employee_name
-            )
-
-            st.session_state.myjv_jv_id = None
-            st.session_state.dashboard_jv_id = None
-
-            st.success(
-                f"{jv_number} submitted for approval."
-            )
-            st.rerun()
-
-    with c3:
         confirm_cancel = st.checkbox(
             "Confirm cancel",
             key=f"confirm_cancel_draft_{jv_id}"
         )
-
         if st.button(
             "Cancel JV",
             use_container_width=True,
             disabled=not confirm_cancel,
             key=f"cancel_draft_{jv_id}"
         ):
-            cancel_draft(
-                jv_id,
-                employee_no,
-                employee_name
+            conn = get_connection()
+            conn.execute(
+                "UPDATE jv_headers SET status='DRAFT' WHERE id=? AND status='READY'",
+                (jv_id,)
             )
-
+            conn.commit(); conn.close()
+            cancel_draft(jv_id, employee_no, employee_name)
             st.session_state.myjv_jv_id = None
             st.session_state.dashboard_jv_id = None
-
-            st.success(
-                f"{jv_number} cancelled."
-            )
+            st.success(f"{jv_number} cancelled.")
             st.rerun()
 
 
@@ -3492,7 +3355,8 @@ defaults = {
     "search_jv_id": None,
 
     "audit_month": None,
-    "amend_jv_id": None
+    "amend_jv_id": None,
+    "monthly_month": None
 }
 
 for key, value in defaults.items():
@@ -3547,7 +3411,8 @@ def reset_drilldowns():
         "search_month",
         "search_jv_id",
         "audit_month",
-        "amend_jv_id"
+        "amend_jv_id",
+        "monthly_month"
     ]
 
     for key in keys:
@@ -3650,6 +3515,7 @@ with st.sidebar:
         menu_options = [
             "Dashboard",
             "Create New JV",
+            "Monthly Submission",
             "My JVs",
             "Notifications",
             "New PIC Request"
@@ -3749,7 +3615,7 @@ if st.session_state.page == "Dashboard":
             SELECT COUNT(*)
             FROM jv_headers
             WHERE prepared_by = ?
-            AND status = 'DRAFT'
+            AND status IN ('DRAFT', 'READY')
         """, (
             employee_no,
         )).fetchone()[0]
@@ -3792,7 +3658,7 @@ if st.session_state.page == "Dashboard":
         with c1:
 
             if st.button(
-                f"Draft\n\n{draft_count}",
+                f"Working JVs\n\n{draft_count}",
                 use_container_width=True
             ):
 
@@ -4123,7 +3989,7 @@ if st.session_state.page == "Dashboard":
                 if selected_status == "DRAFT":
 
                     query += """
-                        AND status = 'DRAFT'
+                        AND status IN ('DRAFT', 'READY')
                     """
 
                 elif selected_status == "PENDING":
@@ -4482,6 +4348,11 @@ elif st.session_state.page == "Create New JV":
         accounting_period
     )
 
+    month_locked_for_new_jv = month_has_been_submitted(
+        accounting_period,
+        employee_no
+    )
+
     with col2:
 
         st.markdown(
@@ -4527,7 +4398,12 @@ elif st.session_state.page == "Create New JV":
     if selected_period_status == "CLOSED":
         st.error(
             f"{month_label(accounting_period.strftime('%Y-%m'))} is CLOSED. "
-            "New JVs cannot be submitted for this accounting month."
+            "New JVs cannot be saved for this accounting month."
+        )
+    elif month_locked_for_new_jv:
+        st.error(
+            f"{month_label(accounting_period.strftime('%Y-%m'))} has already been submitted for approval. "
+            "New JVs are locked for this month."
         )
     else:
         st.caption(
@@ -4788,94 +4664,158 @@ elif st.session_state.page == "Create New JV":
             "Submission is not allowed because the accounting period is CLOSED."
         )
 
+    ready_for_month = not errors
+
     if errors:
-
-        st.error(
-            "JV not ready."
+        st.warning(
+            "JV can be saved, but it will remain DRAFT until all validation issues are cleared."
         )
-
-        with st.expander(
-            "Validation issues"
-        ):
-
+        with st.expander("Validation issues"):
             for error in errors:
-
-                st.write(
-                    f"• {error}"
-                )
-
-        submit_disabled = True
-
+                st.write(f"• {error}")
     else:
+        st.success("READY for monthly submission ✓")
 
-        st.success(
-            "Balanced ✓"
+    if st.button(
+        "Save JV",
+        type="primary",
+        use_container_width=True,
+        disabled=(selected_period_status == "CLOSED" or month_locked_for_new_jv)
+    ):
+        saved_id, saved_status = save_new_working_jv(
+            jv_number,jv_type,accounting_period,remarks,journal_df,
+            total_debit,total_credit,uploaded_files,employee_no,user_name,
+            ready_for_month
         )
+        st.success(f"{jv_number} saved with status {saved_status}.")
+        if saved_status == "READY":
+            st.info("This JV is ready. Submit all JVs together from Monthly Submission.")
+        else:
+            st.info("Complete the JV later from My JVs or Monthly Submission.")
+        st.rerun()
 
-        submit_disabled = False
 
-    c1, c2 = st.columns(2)
+# =========================================================
+# PREPARER - MONTHLY SUBMISSION
+# =========================================================
 
-    with c1:
+elif st.session_state.page == "Monthly Submission":
 
-        if st.button(
-            "Save Draft",
-            use_container_width=True,
-            disabled=selected_period_status == "CLOSED"
-        ):
+    if role != "PREPARER":
+        st.error("Access denied.")
+        st.stop()
 
-            draft_id = save_new_draft(
-                jv_number,
-                jv_type,
-                accounting_period,
-                remarks,
-                journal_df,
-                total_debit,
-                total_credit,
-                uploaded_files,
-                employee_no,
-                user_name
-            )
+    st.header("Monthly JV Submission")
+    st.caption(
+        "Prepare and save individual JVs during the month. "
+        "When every JV is READY, submit the whole month once."
+    )
 
-            st.success(
-                f"{jv_number} saved as Draft."
-            )
-
-            st.info(
-                "Open My JVs to continue or submit this Draft."
-            )
-
+    if st.session_state.monthly_month:
+        selected_month = st.session_state.monthly_month
+        if st.button("← Back to Months"):
+            st.session_state.monthly_month = None
             st.rerun()
 
-    with c2:
+        st.subheader(month_label(selected_month))
+        counts, month_status = get_month_submission_summary(selected_month, employee_no)
 
-        if st.button(
-            "Submit for Approval",
-            type="primary",
-            disabled=submit_disabled,
-            use_container_width=True
-        ):
+        c1,c2,c3,c4 = st.columns(4)
+        c1.metric("Draft", counts.get("DRAFT",0))
+        c2.metric("Ready", counts.get("READY",0))
+        c3.metric(
+            "Pending / Amendment",
+            counts.get("PENDING APPROVAL",0)+counts.get("RESUBMITTED",0)+counts.get("AMENDMENT REQUIRED",0)
+        )
+        c4.metric("Approved", counts.get("APPROVED",0)+counts.get("POSTED TO UBS",0))
 
-            save_jv(
-                jv_number,
-                jv_type,
-                accounting_period,
-                remarks,
-                journal_df,
-                total_debit,
-                total_credit,
-                uploaded_files,
-                employee_no,
-                user_name
+        st.info(f"Monthly Status: **{month_status}**")
+
+        conn = get_connection()
+        rows = conn.execute("""
+            SELECT id,jv_number,jv_type,total_debit,status
+            FROM jv_headers
+            WHERE prepared_by=? AND accounting_period=?
+            ORDER BY id
+        """, (employee_no,selected_month)).fetchall()
+        conn.close()
+
+        if not rows:
+            st.info("No JV records for this month.")
+        else:
+            for jv_id,jv_number,jv_type,amount,status in rows:
+                c1,c2,c3,c4 = st.columns([2,2,2,1])
+                c1.write(f"**{jv_number}**")
+                c2.write(jv_type)
+                c3.write(f"RM {amount:,.2f}  \n{status}")
+                with c4:
+                    if status in ("DRAFT","READY"):
+                        if st.button("Open", key=f"monthly_open_{jv_id}", use_container_width=True):
+                            st.session_state.myjv_jv_id = jv_id
+                            st.session_state.page = "My JVs"
+                            st.rerun()
+                    else:
+                        st.caption("Submitted")
+                st.divider()
+
+        draft_count = counts.get("DRAFT",0)
+        ready_count = counts.get("READY",0)
+        already_submitted = month_has_been_submitted(selected_month, employee_no)
+
+        if already_submitted:
+            st.success("This month has already been submitted to the Approver.")
+        elif draft_count > 0:
+            st.warning(f"Monthly submission is blocked. {draft_count} JV(s) are still DRAFT.")
+        elif ready_count == 0:
+            st.warning("There are no READY JVs to submit for this month.")
+        else:
+            st.success(f"All {ready_count} active JV(s) are READY for monthly submission.")
+            confirm_month = st.checkbox(
+                f"I confirm that all JVs for {month_label(selected_month)} are complete.",
+                key=f"confirm_month_{selected_month}"
             )
+            if st.button(
+                f"Submit {month_label(selected_month)} for Approval",
+                type="primary",
+                use_container_width=True,
+                disabled=not confirm_month,
+                key=f"submit_month_{selected_month}"
+            ):
+                try:
+                    batch_id,jv_count = submit_monthly_batch(selected_month,employee_no,user_name)
+                    st.success(
+                        f"{jv_count} JV(s) submitted successfully for {month_label(selected_month)}."
+                    )
+                    st.rerun()
+                except Exception as exc:
+                    st.error(str(exc))
 
-            st.success(
-                f"{jv_number} submitted successfully."
-            )
+    else:
+        conn = get_connection()
+        month_rows = conn.execute("""
+            SELECT DISTINCT accounting_period
+            FROM jv_headers
+            WHERE prepared_by=?
+            ORDER BY accounting_period DESC
+        """, (employee_no,)).fetchall()
+        conn.close()
 
-            st.info(
-                "Available in Approver's Approval Inbox."
-            )
+        if not month_rows:
+            st.info("No monthly JV workspace yet. Create and save your first JV.")
+        else:
+            for (period,) in month_rows:
+                counts,month_status = get_month_submission_summary(period,employee_no)
+                total = sum(counts.values())
+                ready = counts.get("READY",0)
+                draft = counts.get("DRAFT",0)
+                c1,c2,c3 = st.columns([4,2,1])
+                c1.write(f"### {month_label(period)}")
+                c2.write(f"**{month_status}**  \n{total} JV | {ready} Ready | {draft} Draft")
+                with c3:
+                    if st.button("Open", key=f"open_month_workspace_{period}", use_container_width=True):
+                        st.session_state.monthly_month = period
+                        st.rerun()
+                st.divider()
 
 
 # =========================================================
@@ -5619,6 +5559,13 @@ elif st.session_state.page == "Search JVs":
                 AND j.status IN (
                     'APPROVED',
                     'POSTED TO UBS'
+                )
+            """
+        elif role == "APPROVER":
+            query += """
+                AND j.status NOT IN (
+                    'DRAFT',
+                    'READY'
                 )
             """
 
