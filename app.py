@@ -321,6 +321,32 @@ def initialise_database():
         )
     """)
 
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS jv_type_master (
+            jv_type TEXT PRIMARY KEY,
+            status TEXT NOT NULL DEFAULT 'ACTIVE',
+            attachment_rule TEXT NOT NULL DEFAULT 'OPTIONAL',
+            supporting_document_notes TEXT,
+            entity TEXT NOT NULL DEFAULT 'JKPSD',
+            created_by TEXT,
+            created_at TEXT NOT NULL,
+            updated_by TEXT,
+            updated_at TEXT NOT NULL
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS jv_type_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            jv_type TEXT NOT NULL,
+            action TEXT NOT NULL,
+            snapshot_json TEXT NOT NULL,
+            changed_by TEXT NOT NULL,
+            changed_name TEXT NOT NULL,
+            changed_at TEXT NOT NULL
+        )
+    """)
+
     # Safe migration for databases created by an earlier prototype version.
     header_columns = [
         row[1]
@@ -997,6 +1023,188 @@ def log_gl_history(gl_code, action, employee_no, employee_name):
             VALUES (?, ?, ?, ?, ?, ?)
         """, (
             gl_code,
+            action,
+            json.dumps(snapshot),
+            employee_no,
+            employee_name,
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        ))
+
+        conn.commit()
+
+    conn.close()
+
+
+
+def seed_jv_types():
+    """Seed the original prototype JV types only when master is empty."""
+    defaults = [
+        "Depreciation",
+        "Payroll",
+        "AmIncome Placement",
+        "Bank",
+        "Accrual",
+        "Provision",
+        "Other"
+    ]
+
+    conn = get_connection()
+    count = conn.execute(
+        "SELECT COUNT(*) FROM jv_type_master"
+    ).fetchone()[0]
+
+    if count == 0:
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        for jv_type in defaults:
+            conn.execute("""
+                INSERT INTO jv_type_master (
+                    jv_type,
+                    status,
+                    attachment_rule,
+                    supporting_document_notes,
+                    entity,
+                    created_by,
+                    created_at,
+                    updated_by,
+                    updated_at
+                )
+                VALUES (?, 'ACTIVE', 'OPTIONAL', '', 'JKPSD', 'SYSTEM', ?, 'SYSTEM', ?)
+            """, (
+                jv_type,
+                now,
+                now
+            ))
+
+    conn.commit()
+    conn.close()
+
+
+def get_jv_type_options(include_inactive=False):
+    conn = get_connection()
+
+    if include_inactive:
+        rows = conn.execute("""
+            SELECT jv_type, status
+            FROM jv_type_master
+            WHERE entity = 'JKPSD'
+            ORDER BY jv_type
+        """).fetchall()
+    else:
+        rows = conn.execute("""
+            SELECT jv_type, status
+            FROM jv_type_master
+            WHERE entity = 'JKPSD'
+            AND status = 'ACTIVE'
+            ORDER BY jv_type
+        """).fetchall()
+
+    conn.close()
+
+    options = []
+
+    for jv_type, status in rows:
+        label = jv_type
+
+        if include_inactive and status != "ACTIVE":
+            label += " [INACTIVE]"
+
+        options.append(label)
+
+    return options
+
+
+def clean_jv_type_label(value):
+    if value is None:
+        return ""
+
+    value = str(value)
+
+    if value.endswith(" [INACTIVE]"):
+        return value[:-11]
+
+    return value
+
+
+def get_jv_type_rule(jv_type):
+    clean_type = clean_jv_type_label(jv_type)
+
+    conn = get_connection()
+
+    row = conn.execute("""
+        SELECT
+            status,
+            attachment_rule,
+            supporting_document_notes
+        FROM jv_type_master
+        WHERE jv_type = ?
+        AND entity = 'JKPSD'
+    """, (
+        clean_type,
+    )).fetchone()
+
+    conn.close()
+
+    if not row:
+        return None
+
+    return {
+        "status": row[0],
+        "attachment_rule": row[1],
+        "notes": row[2] or ""
+    }
+
+
+def jv_type_is_active(jv_type):
+    rule = get_jv_type_rule(jv_type)
+    return bool(rule and rule["status"] == "ACTIVE")
+
+
+def log_jv_type_history(jv_type, action, employee_no, employee_name):
+    conn = get_connection()
+
+    row = conn.execute("""
+        SELECT
+            jv_type,
+            status,
+            attachment_rule,
+            supporting_document_notes,
+            entity,
+            created_by,
+            created_at,
+            updated_by,
+            updated_at
+        FROM jv_type_master
+        WHERE jv_type = ?
+    """, (
+        jv_type,
+    )).fetchone()
+
+    if row:
+        snapshot = {
+            "jv_type": row[0],
+            "status": row[1],
+            "attachment_rule": row[2],
+            "supporting_document_notes": row[3],
+            "entity": row[4],
+            "created_by": row[5],
+            "created_at": row[6],
+            "updated_by": row[7],
+            "updated_at": row[8]
+        }
+
+        conn.execute("""
+            INSERT INTO jv_type_history (
+                jv_type,
+                action,
+                snapshot_json,
+                changed_by,
+                changed_name,
+                changed_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (
+            jv_type,
             action,
             json.dumps(snapshot),
             employee_no,
@@ -1903,27 +2111,53 @@ def render_amendment_controls(jv_id, employee_no, employee_name):
         f"Current revision: {int(revision_no or 1)}"
     )
 
-    type_options = [
-        "Depreciation",
-        "Payroll",
-        "AmIncome Placement",
-        "Bank",
-        "Accrual",
-        "Provision",
-        "Other"
-    ]
+    type_options = get_jv_type_options(
+        include_inactive=True
+    )
 
-    type_index = 0
+    current_type_label = current_type
 
-    if current_type in type_options:
-        type_index = type_options.index(current_type)
+    if not jv_type_is_active(current_type):
+        current_type_label = f"{current_type} [INACTIVE]"
 
-    amended_type = st.selectbox(
+    if current_type_label not in type_options:
+        type_options.insert(
+            0,
+            current_type_label
+        )
+
+    type_index = (
+        type_options.index(current_type_label)
+        if current_type_label in type_options
+        else 0
+    )
+
+    amended_type_display = st.selectbox(
         "JV Type",
         type_options,
         index=type_index,
         key=f"amend_type_{jv_id}"
     )
+
+    amended_type = clean_jv_type_label(
+        amended_type_display
+    )
+
+    amended_type_rule = get_jv_type_rule(
+        amended_type
+    )
+
+    if amended_type_rule:
+        attachment_rule_text = amended_type_rule["attachment_rule"].title()
+
+        st.caption(
+            f"Supporting document rule: {attachment_rule_text}"
+        )
+
+        if amended_type_rule["notes"]:
+            st.caption(
+                amended_type_rule["notes"]
+            )
 
     amended_remarks = st.text_input(
         "JV Description / Remarks",
@@ -1986,6 +2220,22 @@ def render_amendment_controls(jv_id, employee_no, employee_name):
     )
 
     errors, total_debit, total_credit = validate_journal(amended_df)
+
+    if not jv_type_is_active(amended_type):
+        errors.append(
+            "Selected JV Type is inactive or invalid."
+        )
+
+    if (
+        amended_type_rule
+        and amended_type_rule["attachment_rule"] == "REQUIRED"
+    ):
+        existing_active_attachments = get_active_attachments(jv_id)
+
+        if not existing_active_attachments and not amendment_files:
+            errors.append(
+                f"Supporting document is required for JV Type: {amended_type}."
+            )
 
     c1, c2, c3 = st.columns(3)
 
@@ -2539,6 +2789,7 @@ seed_demo_users()
 
 
 seed_gl_master()
+seed_jv_types()
 
 
 # =========================================================
@@ -2972,9 +3223,16 @@ if st.session_state.page == "Dashboard":
             configured_open_periods
         )
 
+        active_jv_type_count = conn.execute("""
+            SELECT COUNT(*)
+            FROM jv_type_master
+            WHERE entity = 'JKPSD'
+            AND status = 'ACTIVE'
+        """).fetchone()[0]
+
         c4.metric(
             "JV Types",
-            7
+            active_jv_type_count
         )
 
     conn.close()
@@ -3451,18 +3709,29 @@ elif st.session_state.page == "Create New JV":
 
     with c1:
 
+        active_jv_types = get_jv_type_options(
+            include_inactive=False
+        )
+
         jv_type = st.selectbox(
             "JV Type",
-            [
-                "Depreciation",
-                "Payroll",
-                "AmIncome Placement",
-                "Bank",
-                "Accrual",
-                "Provision",
-                "Other"
-            ]
+            active_jv_types
         )
+
+        selected_jv_type_rule = get_jv_type_rule(
+            jv_type
+        )
+
+        if selected_jv_type_rule:
+            st.caption(
+                "Supporting document: "
+                f"{selected_jv_type_rule['attachment_rule'].title()}"
+            )
+
+            if selected_jv_type_rule["notes"]:
+                st.caption(
+                    selected_jv_type_rule["notes"]
+                )
 
     remarks = st.text_input(
         "JV Description / Remarks"
@@ -3581,8 +3850,18 @@ elif st.session_state.page == "Create New JV":
 
     st.divider()
 
+    attachment_label = "Supporting Documents"
+
+    if (
+        selected_jv_type_rule
+        and selected_jv_type_rule["attachment_rule"] == "REQUIRED"
+    ):
+        attachment_label += " (Required)"
+    else:
+        attachment_label += " (Optional)"
+
     uploaded_files = st.file_uploader(
-        "Supporting Documents (Optional)",
+        attachment_label,
         type=[
             "pdf",
             "xlsx",
@@ -3694,6 +3973,20 @@ elif st.session_state.page == "Create New JV":
             f"Dr RM{total_debit:,.2f} "
             f"does not match "
             f"Cr RM{total_credit:,.2f}."
+        )
+
+    if not jv_type_is_active(jv_type):
+        errors.append(
+            "Selected JV Type is inactive or invalid."
+        )
+
+    if (
+        selected_jv_type_rule
+        and selected_jv_type_rule["attachment_rule"] == "REQUIRED"
+        and not uploaded_files
+    ):
+        errors.append(
+            f"Supporting document is required for JV Type: {jv_type}."
         )
 
     if selected_period_status == "CLOSED":
@@ -5706,42 +5999,362 @@ elif st.session_state.page == "JV Type Master":
         "JV Type Master"
     )
 
-    type_df = pd.DataFrame([
-        {
-            "JV Type": "Depreciation",
-            "Attachment": "Optional"
-        },
-        {
-            "JV Type": "Payroll",
-            "Attachment": "Optional"
-        },
-        {
-            "JV Type": "AmIncome Placement",
-            "Attachment": "Optional"
-        },
-        {
-            "JV Type": "Bank",
-            "Attachment": "Optional"
-        },
-        {
-            "JV Type": "Accrual",
-            "Attachment": "Optional"
-        },
-        {
-            "JV Type": "Provision",
-            "Attachment": "Optional"
-        },
-        {
-            "JV Type": "Other",
-            "Attachment": "Optional"
-        }
-    ])
-
-    st.dataframe(
-        type_df,
-        use_container_width=True,
-        hide_index=True
+    st.caption(
+        "Only ACTIVE JV Types can be selected for new Journal Vouchers."
     )
+
+    tab1, tab2, tab3 = st.tabs(
+        [
+            "JV Type List",
+            "Add / Update",
+            "Change History"
+        ]
+    )
+
+    # -----------------------------------------------------
+    # JV TYPE LIST
+    # -----------------------------------------------------
+
+    with tab1:
+
+        status_filter = st.selectbox(
+            "Status",
+            [
+                "ALL",
+                "ACTIVE",
+                "INACTIVE"
+            ],
+            key="jv_type_status_filter"
+        )
+
+        conn = get_connection()
+
+        query = """
+            SELECT
+                jv_type AS "JV Type",
+                status AS "Status",
+                attachment_rule AS "Supporting Document",
+                supporting_document_notes AS "Document Notes",
+                entity AS "Entity",
+                updated_by AS "Updated By",
+                updated_at AS "Updated At"
+            FROM jv_type_master
+            WHERE entity = 'JKPSD'
+        """
+
+        params = []
+
+        if status_filter != "ALL":
+            query += " AND status = ?"
+            params.append(status_filter)
+
+        query += " ORDER BY jv_type"
+
+        type_df = pd.read_sql_query(
+            query,
+            conn,
+            params=params
+        )
+
+        conn.close()
+
+        if not type_df.empty:
+            type_df["Updated At"] = type_df["Updated At"].apply(
+                display_datetime
+            )
+
+        st.dataframe(
+            type_df,
+            use_container_width=True,
+            hide_index=True
+        )
+
+    # -----------------------------------------------------
+    # ADD / UPDATE
+    # -----------------------------------------------------
+
+    with tab2:
+
+        mode = st.radio(
+            "Action",
+            [
+                "Add New JV Type",
+                "Update Existing JV Type"
+            ],
+            horizontal=True
+        )
+
+        if mode == "Add New JV Type":
+
+            new_type = st.text_input(
+                "JV Type Name",
+                key="new_jv_type_name"
+            )
+
+            attachment_rule = st.selectbox(
+                "Supporting Document Requirement",
+                [
+                    "OPTIONAL",
+                    "REQUIRED"
+                ],
+                key="new_jv_type_attachment"
+            )
+
+            document_notes = st.text_area(
+                "Supporting Document Notes",
+                key="new_jv_type_notes",
+                placeholder=(
+                    "Example: Attach payroll summary and approved payroll schedule."
+                )
+            )
+
+            if st.button(
+                "Add JV Type",
+                type="primary",
+                key="add_jv_type_button"
+            ):
+
+                clean_type = new_type.strip()
+
+                if not clean_type:
+
+                    st.error(
+                        "JV Type Name is required."
+                    )
+
+                else:
+
+                    conn = get_connection()
+
+                    exists = conn.execute(
+                        "SELECT 1 FROM jv_type_master WHERE jv_type = ?",
+                        (clean_type,)
+                    ).fetchone()
+
+                    if exists:
+
+                        conn.close()
+
+                        st.error(
+                            "This JV Type already exists."
+                        )
+
+                    else:
+
+                        now = datetime.now().strftime(
+                            "%Y-%m-%d %H:%M:%S"
+                        )
+
+                        conn.execute("""
+                            INSERT INTO jv_type_master (
+                                jv_type,
+                                status,
+                                attachment_rule,
+                                supporting_document_notes,
+                                entity,
+                                created_by,
+                                created_at,
+                                updated_by,
+                                updated_at
+                            )
+                            VALUES (?, 'ACTIVE', ?, ?, 'JKPSD', ?, ?, ?, ?)
+                        """, (
+                            clean_type,
+                            attachment_rule,
+                            document_notes.strip(),
+                            employee_no,
+                            now,
+                            employee_no,
+                            now
+                        ))
+
+                        conn.commit()
+                        conn.close()
+
+                        log_jv_type_history(
+                            clean_type,
+                            "CREATED",
+                            employee_no,
+                            user_name
+                        )
+
+                        st.success(
+                            f"JV Type '{clean_type}' created and activated."
+                        )
+
+                        st.rerun()
+
+        else:
+
+            conn = get_connection()
+
+            existing_types = conn.execute("""
+                SELECT
+                    jv_type,
+                    status,
+                    attachment_rule,
+                    supporting_document_notes
+                FROM jv_type_master
+                WHERE entity = 'JKPSD'
+                ORDER BY jv_type
+            """).fetchall()
+
+            conn.close()
+
+            if not existing_types:
+
+                st.info(
+                    "No JV Types available."
+                )
+
+            else:
+
+                selected_type = st.selectbox(
+                    "Select JV Type",
+                    [
+                        row[0]
+                        for row in existing_types
+                    ],
+                    key="edit_jv_type_select"
+                )
+
+                selected = next(
+                    row
+                    for row in existing_types
+                    if row[0] == selected_type
+                )
+
+                (
+                    _,
+                    current_status,
+                    current_attachment_rule,
+                    current_notes
+                ) = selected
+
+                status = st.selectbox(
+                    "Status",
+                    [
+                        "ACTIVE",
+                        "INACTIVE"
+                    ],
+                    index=0 if current_status == "ACTIVE" else 1,
+                    key=f"jv_type_status_{selected_type}"
+                )
+
+                rule_options = [
+                    "OPTIONAL",
+                    "REQUIRED"
+                ]
+
+                attachment_rule = st.selectbox(
+                    "Supporting Document Requirement",
+                    rule_options,
+                    index=(
+                        rule_options.index(current_attachment_rule)
+                        if current_attachment_rule in rule_options
+                        else 0
+                    ),
+                    key=f"jv_type_rule_{selected_type}"
+                )
+
+                document_notes = st.text_area(
+                    "Supporting Document Notes",
+                    value=current_notes or "",
+                    key=f"jv_type_notes_{selected_type}"
+                )
+
+                if st.button(
+                    "Save JV Type Changes",
+                    type="primary",
+                    key=f"save_jv_type_{selected_type}"
+                ):
+
+                    log_jv_type_history(
+                        selected_type,
+                        "BEFORE_UPDATE",
+                        employee_no,
+                        user_name
+                    )
+
+                    now = datetime.now().strftime(
+                        "%Y-%m-%d %H:%M:%S"
+                    )
+
+                    conn = get_connection()
+
+                    conn.execute("""
+                        UPDATE jv_type_master
+                        SET
+                            status = ?,
+                            attachment_rule = ?,
+                            supporting_document_notes = ?,
+                            updated_by = ?,
+                            updated_at = ?
+                        WHERE jv_type = ?
+                    """, (
+                        status,
+                        attachment_rule,
+                        document_notes.strip(),
+                        employee_no,
+                        now,
+                        selected_type
+                    ))
+
+                    conn.commit()
+                    conn.close()
+
+                    log_jv_type_history(
+                        selected_type,
+                        "AFTER_UPDATE",
+                        employee_no,
+                        user_name
+                    )
+
+                    st.success(
+                        f"JV Type '{selected_type}' updated."
+                    )
+
+                    st.rerun()
+
+    # -----------------------------------------------------
+    # HISTORY
+    # -----------------------------------------------------
+
+    with tab3:
+
+        conn = get_connection()
+
+        history_df = pd.read_sql_query("""
+            SELECT
+                jv_type AS "JV Type",
+                action AS "Action",
+                changed_by AS "Employee No.",
+                changed_name AS "Changed By",
+                changed_at AS "Changed At"
+            FROM jv_type_history
+            ORDER BY id DESC
+            LIMIT 100
+        """, conn)
+
+        conn.close()
+
+        if history_df.empty:
+
+            st.info(
+                "No JV Type changes recorded yet."
+            )
+
+        else:
+
+            history_df["Changed At"] = history_df["Changed At"].apply(
+                display_datetime
+            )
+
+            st.dataframe(
+                history_df,
+                use_container_width=True,
+                hide_index=True
+            )
 
 
 elif st.session_state.page == "Period Control":
