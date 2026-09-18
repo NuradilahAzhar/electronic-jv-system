@@ -3794,7 +3794,12 @@ defaults = {
 
     "audit_month": None,
     "amend_jv_id": None,
-    "monthly_month": None
+    "monthly_month": None,
+
+    "last_saved_jv_number": None,
+    "last_saved_jv_status": None,
+    "last_saved_jv_id": None,
+    "show_saved_jv_confirmation": False
 }
 
 for key, value in defaults.items():
@@ -4780,6 +4785,62 @@ elif st.session_state.page == "Create / Save JV":
         "You do not need to submit each JV separately."
     )
 
+    if st.session_state.show_saved_jv_confirmation:
+
+        saved_no = st.session_state.last_saved_jv_number
+        saved_status = st.session_state.last_saved_jv_status
+
+        st.success(
+            f"✓ {saved_no} successfully saved as {saved_status}."
+        )
+
+        if saved_status == "READY":
+            st.caption(
+                "This JV is ready and will be included in the monthly submission."
+            )
+        else:
+            st.caption(
+                "This JV is saved as Draft. You can complete it later from "
+                "My JVs or Monthly Workspace."
+            )
+
+        action1, action2 = st.columns(2)
+
+        with action1:
+            if st.button(
+                "＋ Create Next JV",
+                type="primary",
+                use_container_width=True,
+                key="create_next_jv_after_save"
+            ):
+                st.session_state.show_saved_jv_confirmation = False
+                st.session_state.last_saved_jv_number = None
+                st.session_state.last_saved_jv_status = None
+                st.session_state.last_saved_jv_id = None
+
+                for widget_key in [
+                    "journal_editor",
+                    "create_remarks",
+                    "create_supporting_docs",
+                    "create_jv_type"
+                ]:
+                    if widget_key in st.session_state:
+                        del st.session_state[widget_key]
+
+                st.rerun()
+
+        with action2:
+            if st.button(
+                "Go to Monthly Workspace →",
+                use_container_width=True,
+                key="go_monthly_workspace_after_save"
+            ):
+                st.session_state.show_saved_jv_confirmation = False
+                st.session_state.page = "Monthly Workspace"
+                st.rerun()
+
+        st.divider()
+
     col1, col2 = st.columns(
         [3, 1]
     )
@@ -4796,7 +4857,8 @@ elif st.session_state.page == "Create / Save JV":
 
     accounting_period = st.date_input(
         "Accounting Month",
-        value=date.today()
+        value=date.today(),
+        key="create_accounting_month"
     )
 
     jv_number = generate_jv_number(
@@ -4832,7 +4894,8 @@ elif st.session_state.page == "Create / Save JV":
 
         jv_type = st.selectbox(
             "JV Type",
-            active_jv_types
+            active_jv_types,
+            key="create_jv_type"
         )
 
         selected_jv_type_rule = get_jv_type_rule(
@@ -4851,7 +4914,8 @@ elif st.session_state.page == "Create / Save JV":
                 )
 
     remarks = st.text_input(
-        "JV Description / Remarks"
+        "JV Description / Remarks",
+        key="create_remarks"
     )
 
     if selected_period_status == "CLOSED":
@@ -4993,7 +5057,8 @@ elif st.session_state.page == "Create / Save JV":
             "jpeg",
             "png"
         ],
-        accept_multiple_files=True
+        accept_multiple_files=True,
+        key="create_supporting_docs"
     )
 
     st.caption(
@@ -5142,15 +5207,33 @@ elif st.session_state.page == "Create / Save JV":
         disabled=(selected_period_status == "CLOSED" or month_locked_for_new_jv)
     ):
         saved_id, saved_status = save_new_working_jv(
-            jv_number,jv_type,accounting_period,remarks,journal_df,
-            total_debit,total_credit,uploaded_files,employee_no,user_name,
+            jv_number,
+            jv_type,
+            accounting_period,
+            remarks,
+            journal_df,
+            total_debit,
+            total_credit,
+            uploaded_files,
+            employee_no,
+            user_name,
             ready_for_month
         )
-        st.success(f"{jv_number} saved with status {saved_status}.")
-        if saved_status == "READY":
-            st.info("This JV is ready. Submit all JVs together from Monthly Submission.")
-        else:
-            st.info("Complete the JV later from My JVs or Monthly Submission.")
+
+        st.session_state.last_saved_jv_id = saved_id
+        st.session_state.last_saved_jv_number = jv_number
+        st.session_state.last_saved_jv_status = saved_status
+        st.session_state.show_saved_jv_confirmation = True
+
+        for widget_key in [
+            "journal_editor",
+            "create_remarks",
+            "create_supporting_docs",
+            "create_jv_type"
+        ]:
+            if widget_key in st.session_state:
+                del st.session_state[widget_key]
+
         st.rerun()
 
 
