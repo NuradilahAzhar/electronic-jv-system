@@ -4605,25 +4605,26 @@ elif st.session_state.page == "Search JVs":
         "APPROVER",
         "AUDITOR"
     ]:
-
-        st.error(
-            "Access denied."
-        )
-
+        st.error("Access denied.")
         st.stop()
 
-    st.header(
-        "JV History"
-    )
+    st.header("Search JVs")
 
+    if role == "AUDITOR":
+        st.caption(
+            "Read-only search. Auditor view shows approved/final JVs only."
+        )
+    else:
+        st.caption(
+            "Search Journal Vouchers using one or more filters."
+        )
 
-    # DETAIL
+    # -----------------------------------------------------
+    # JV DETAIL
+    # -----------------------------------------------------
     if st.session_state.search_jv_id:
 
-        if st.button(
-            "← Back to JV List"
-        ):
-
+        if st.button("← Back to Search Results"):
             st.session_state.search_jv_id = None
             st.rerun()
 
@@ -4631,87 +4632,276 @@ elif st.session_state.page == "Search JVs":
             st.session_state.search_jv_id
         )
 
+    else:
 
-    # JV LIST
-    elif st.session_state.search_month:
+        # -------------------------------------------------
+        # FILTERS
+        # -------------------------------------------------
+        c1, c2, c3 = st.columns(3)
 
-        if st.button(
-            "← Back to Months"
-        ):
+        with c1:
+            search_jv_no = st.text_input(
+                "JV Number",
+                placeholder="e.g. JV260901"
+            )
 
-            st.session_state.search_month = None
-            st.rerun()
+            search_year = st.selectbox(
+                "Year",
+                ["ALL"] + [
+                    str(year)
+                    for year in range(2025, 2031)
+                ]
+            )
 
-        selected_month = (
-            st.session_state.search_month
+            search_status_options = [
+                "ALL",
+                "PENDING APPROVAL",
+                "AMENDMENT REQUIRED",
+                "RESUBMITTED",
+                "APPROVED",
+                "POSTED TO UBS",
+                "CANCELLED"
+            ]
+
+            if role == "AUDITOR":
+                search_status_options = [
+                    "ALL",
+                    "APPROVED",
+                    "POSTED TO UBS"
+                ]
+
+            search_status = st.selectbox(
+                "Status",
+                search_status_options
+            )
+
+        with c2:
+            month_names_search = [
+                "ALL",
+                "January",
+                "February",
+                "March",
+                "April",
+                "May",
+                "June",
+                "July",
+                "August",
+                "September",
+                "October",
+                "November",
+                "December"
+            ]
+
+            search_month_name = st.selectbox(
+                "Month",
+                month_names_search
+            )
+
+            search_type = st.selectbox(
+                "JV Type",
+                ["ALL"] + get_jv_type_options(
+                    include_inactive=True
+                )
+            )
+
+            search_gl = st.text_input(
+                "G/L Code",
+                placeholder="e.g. 4100/001"
+            )
+
+        with c3:
+            search_preparer = st.text_input(
+                "Preparer",
+                placeholder="Name or Employee No."
+            )
+
+            search_approver = st.text_input(
+                "Approver",
+                placeholder="Name or Employee No."
+            )
+
+            amount_from = st.number_input(
+                "Amount From (RM)",
+                min_value=0.0,
+                value=0.0,
+                step=100.0
+            )
+
+            amount_to = st.number_input(
+                "Amount To (RM)",
+                min_value=0.0,
+                value=0.0,
+                step=100.0,
+                help="Leave at 0 for no upper limit."
+            )
+
+        use_approval_date = st.checkbox(
+            "Filter by Approval Date"
         )
 
-        st.subheader(
-            month_label(selected_month)
-        )
+        approval_date_from = None
+        approval_date_to = None
 
-        conn = get_connection()
+        if use_approval_date:
+            d1, d2 = st.columns(2)
+
+            with d1:
+                approval_date_from = st.date_input(
+                    "Approval Date From"
+                )
+
+            with d2:
+                approval_date_to = st.date_input(
+                    "Approval Date To"
+                )
+
+        # -------------------------------------------------
+        # QUERY
+        # -------------------------------------------------
+        query = """
+            SELECT DISTINCT
+                j.id,
+                j.jv_number,
+                j.accounting_period,
+                j.jv_type,
+                j.total_debit,
+                j.status,
+                j.prepared_by,
+                j.prepared_name,
+                j.approved_by,
+                j.approved_name,
+                j.approved_at
+            FROM jv_headers j
+            LEFT JOIN jv_lines l
+                ON j.id = l.jv_id
+            WHERE 1 = 1
+        """
+
+        params = []
 
         if role == "AUDITOR":
-
-            rows = conn.execute("""
-                SELECT
-                    id,
-                    jv_number,
-                    jv_type,
-                    total_debit,
-                    status,
-                    prepared_name,
-                    approved_name
-                FROM jv_headers
-                WHERE accounting_period = ?
-                AND status IN (
+            query += """
+                AND j.status IN (
                     'APPROVED',
                     'POSTED TO UBS'
                 )
-                ORDER BY id DESC
-            """, (
-                selected_month,
-            )).fetchall()
+            """
 
-        else:
+        if search_jv_no.strip():
+            query += " AND UPPER(j.jv_number) LIKE UPPER(?)"
+            params.append(
+                f"%{search_jv_no.strip()}%"
+            )
 
-            rows = conn.execute("""
-                SELECT
-                    id,
-                    jv_number,
-                    jv_type,
-                    total_debit,
-                    status,
-                    prepared_name,
-                    approved_name
-                FROM jv_headers
-                WHERE accounting_period = ?
-                ORDER BY id DESC
-            """, (
-                selected_month,
-            )).fetchall()
+        if search_year != "ALL":
+            query += " AND substr(j.accounting_period, 1, 4) = ?"
+            params.append(search_year)
+
+        if search_month_name != "ALL":
+            month_number = (
+                month_names_search.index(
+                    search_month_name
+                )
+            )
+            query += " AND substr(j.accounting_period, 6, 2) = ?"
+            params.append(
+                f"{month_number:02d}"
+            )
+
+        if search_status != "ALL":
+            query += " AND j.status = ?"
+            params.append(search_status)
+
+        if search_type != "ALL":
+            query += " AND j.jv_type = ?"
+            params.append(
+                clean_jv_type_label(search_type)
+            )
+
+        if search_gl.strip():
+            query += " AND UPPER(l.gl_code) LIKE UPPER(?)"
+            params.append(
+                f"%{search_gl.strip()}%"
+            )
+
+        if search_preparer.strip():
+            query += """
+                AND (
+                    UPPER(j.prepared_name) LIKE UPPER(?)
+                    OR UPPER(j.prepared_by) LIKE UPPER(?)
+                )
+            """
+            value = f"%{search_preparer.strip()}%"
+            params.extend([value, value])
+
+        if search_approver.strip():
+            query += """
+                AND (
+                    UPPER(COALESCE(j.approved_name, '')) LIKE UPPER(?)
+                    OR UPPER(COALESCE(j.approved_by, '')) LIKE UPPER(?)
+                )
+            """
+            value = f"%{search_approver.strip()}%"
+            params.extend([value, value])
+
+        if amount_from > 0:
+            query += " AND j.total_debit >= ?"
+            params.append(float(amount_from))
+
+        if amount_to > 0:
+            query += " AND j.total_debit <= ?"
+            params.append(float(amount_to))
+
+        if use_approval_date:
+            query += """
+                AND date(j.approved_at) >= date(?)
+                AND date(j.approved_at) <= date(?)
+            """
+            params.extend([
+                approval_date_from.strftime("%Y-%m-%d"),
+                approval_date_to.strftime("%Y-%m-%d")
+            ])
+
+        query += " ORDER BY j.accounting_period DESC, j.id DESC"
+
+        conn = get_connection()
+
+        rows = conn.execute(
+            query,
+            params
+        ).fetchall()
 
         conn.close()
 
-        if not rows:
+        st.divider()
 
+        # -------------------------------------------------
+        # RESULTS
+        # -------------------------------------------------
+        st.subheader(
+            f"Search Results ({len(rows)})"
+        )
+
+        if not rows:
             st.info(
-                "No JV records."
+                "No JV records match the selected filters."
             )
 
         else:
-
             for row in rows:
 
                 (
                     jv_id,
                     jv_number,
+                    accounting_period,
                     jv_type,
                     amount,
                     status,
-                    preparer,
-                    approver
+                    prepared_by,
+                    prepared_name,
+                    approved_by,
+                    approved_name,
+                    approved_at
                 ) = row
 
                 c1, c2, c3, c4 = st.columns(
@@ -4723,93 +4913,37 @@ elif st.session_state.page == "Search JVs":
                 )
 
                 c2.write(
-                    jv_type
+                    f"{month_label(accounting_period)}  \n{jv_type}"
                 )
 
                 c3.write(
-                    f"RM {amount:,.2f}"
+                    f"**RM {amount:,.2f}**  \n{status}"
                 )
 
                 with c4:
-
                     if st.button(
                         "Open",
-                        key=f"search_open_{jv_id}"
+                        key=f"advanced_search_open_{jv_id}",
+                        use_container_width=True
                     ):
-
                         st.session_state.search_jv_id = jv_id
                         st.rerun()
 
-                st.caption(
-                    f"{status} | "
-                    f"Preparer: {preparer} | "
-                    f"Approver: {approver or '-'}"
+                details = (
+                    f"Preparer: {prepared_name} ({prepared_by})"
                 )
 
-                st.divider()
+                if approved_name:
+                    details += (
+                        f" | Approver: {approved_name} ({approved_by})"
+                    )
 
+                if approved_at:
+                    details += (
+                        f" | Approved: {display_datetime(approved_at)}"
+                    )
 
-    # MONTH LIST
-    else:
-
-        conn = get_connection()
-
-        if role == "AUDITOR":
-
-            month_rows = conn.execute("""
-                SELECT
-                    accounting_period,
-                    COUNT(*)
-                FROM jv_headers
-                WHERE status IN (
-                    'APPROVED',
-                    'POSTED TO UBS'
-                )
-                GROUP BY accounting_period
-                ORDER BY accounting_period DESC
-            """).fetchall()
-
-        else:
-
-            month_rows = conn.execute("""
-                SELECT
-                    accounting_period,
-                    COUNT(*)
-                FROM jv_headers
-                GROUP BY accounting_period
-                ORDER BY accounting_period DESC
-            """).fetchall()
-
-        conn.close()
-
-        if not month_rows:
-
-            st.info(
-                "No JV records."
-            )
-
-        else:
-
-            for period, total in month_rows:
-
-                c1, c2 = st.columns(
-                    [4, 1]
-                )
-
-                c1.write(
-                    f"### {month_label(period)}"
-                )
-
-                with c2:
-
-                    if st.button(
-                        f"{total} JV",
-                        key=f"search_month_{period}"
-                    ):
-
-                        st.session_state.search_month = period
-                        st.rerun()
-
+                st.caption(details)
                 st.divider()
 
 
@@ -4820,141 +4954,125 @@ elif st.session_state.page == "Search JVs":
 elif st.session_state.page == "Audit Trail":
 
     if role != "AUDITOR":
-
-        st.error(
-            "Access denied."
-        )
-
+        st.error("Access denied.")
         st.stop()
 
-    st.header(
-        "Audit Trail"
-    )
-
+    st.header("Audit Trail")
     st.caption(
-        "Read-only"
+        "Read-only final audit activities. Amendment and resubmission history "
+        "is not displayed in the Auditor view."
     )
 
+    c1, c2, c3 = st.columns(3)
 
-    # MONTH DETAIL
-    if st.session_state.audit_month:
-
-        if st.button(
-            "← Back to Months"
-        ):
-
-            st.session_state.audit_month = None
-            st.rerun()
-
-        selected_month = (
-            st.session_state.audit_month
+    with c1:
+        audit_jv_search = st.text_input(
+            "JV Number",
+            key="audit_jv_search"
         )
 
-        st.subheader(
-            month_label(selected_month)
+    with c2:
+        audit_year = st.selectbox(
+            "Year",
+            ["ALL"] + [
+                str(year)
+                for year in range(2025, 2031)
+            ],
+            key="audit_year_filter"
         )
 
-        conn = get_connection()
+    with c3:
+        audit_action = st.selectbox(
+            "Action",
+            [
+                "ALL",
+                "JV_SUBMITTED",
+                "JV_APPROVED",
+                "JV_POSTED_TO_UBS"
+            ],
+            key="audit_action_filter"
+        )
 
-        audit_df = pd.read_sql_query("""
-            SELECT
-                a.jv_number AS "JV No.",
-                a.event_type AS "Action",
-                a.employee_no AS "Employee No.",
-                a.employee_name AS "Employee",
-                a.role AS "Role",
-                a.comments AS "Comments",
-                a.event_timestamp AS "Date / Time"
-            FROM audit_log a
-            JOIN jv_headers j
-                ON a.jv_id = j.id
-            WHERE j.accounting_period = ?
-            AND j.status IN (
-                'APPROVED',
-                'POSTED TO UBS'
-            )
-            AND a.event_type IN (
-                'JV_SUBMITTED',
-                'JV_APPROVED',
-                'JV_POSTED_TO_UBS'
-            )
-            ORDER BY a.id DESC
-        """, conn, params=(
-            selected_month,
-        ))
+    audit_query = """
+        SELECT
+            a.jv_number AS "JV No.",
+            j.accounting_period AS "Period",
+            a.event_type AS "Action",
+            a.employee_no AS "Employee No.",
+            a.employee_name AS "Employee",
+            a.role AS "Role",
+            a.comments AS "Comments",
+            a.event_timestamp AS "Date / Time"
+        FROM audit_log a
+        JOIN jv_headers j
+            ON a.jv_id = j.id
+        WHERE j.status IN (
+            'APPROVED',
+            'POSTED TO UBS'
+        )
+        AND a.event_type IN (
+            'JV_SUBMITTED',
+            'JV_APPROVED',
+            'JV_POSTED_TO_UBS'
+        )
+    """
 
-        conn.close()
+    audit_params = []
 
-        if not audit_df.empty:
+    if audit_jv_search.strip():
+        audit_query += """
+            AND UPPER(a.jv_number) LIKE UPPER(?)
+        """
+        audit_params.append(
+            f"%{audit_jv_search.strip()}%"
+        )
 
-            audit_df["Date / Time"] = (
-                audit_df["Date / Time"]
-                .apply(display_datetime)
-            )
+    if audit_year != "ALL":
+        audit_query += """
+            AND substr(j.accounting_period, 1, 4) = ?
+        """
+        audit_params.append(audit_year)
 
+    if audit_action != "ALL":
+        audit_query += " AND a.event_type = ?"
+        audit_params.append(audit_action)
+
+    audit_query += """
+        ORDER BY j.accounting_period DESC, a.id DESC
+    """
+
+    conn = get_connection()
+
+    audit_df = pd.read_sql_query(
+        audit_query,
+        conn,
+        params=audit_params
+    )
+
+    conn.close()
+
+    if not audit_df.empty:
+        audit_df["Period"] = audit_df["Period"].apply(
+            month_label
+        )
+        audit_df["Date / Time"] = audit_df["Date / Time"].apply(
+            display_datetime
+        )
+
+    st.subheader(
+        f"Audit Records ({len(audit_df)})"
+    )
+
+    if audit_df.empty:
+        st.info(
+            "No audit records match the selected filters."
+        )
+    else:
         st.dataframe(
             audit_df,
             use_container_width=True,
             hide_index=True
         )
-
-
-    # MONTH LIST
-    else:
-
-        conn = get_connection()
-
-        month_rows = conn.execute("""
-            SELECT
-                j.accounting_period,
-                COUNT(a.id)
-            FROM audit_log a
-            JOIN jv_headers j
-                ON a.jv_id = j.id
-            WHERE j.status IN (
-                'APPROVED',
-                'POSTED TO UBS'
-            )
-            AND a.event_type IN (
-                'JV_SUBMITTED',
-                'JV_APPROVED',
-                'JV_POSTED_TO_UBS'
-            )
-            GROUP BY j.accounting_period
-            ORDER BY j.accounting_period DESC
-        """).fetchall()
-
-        conn.close()
-
-        if not month_rows:
-
-            st.info(
-                "No audit records."
-            )
-
-        else:
-
-            for period, total in month_rows:
-
-                c1, c2 = st.columns(
-                    [4, 1]
-                )
-
-                c1.write(
-                    f"### {month_label(period)}"
-                )
-
-                with c2:
-
-                    if st.button(
-                        f"{total} Activities",
-                        key=f"audit_month_{period}"
-                    ):
-
-                        st.session_state.audit_month = period
-                        st.rerun()
-
-                st.divider()
 
 
 # =========================================================
