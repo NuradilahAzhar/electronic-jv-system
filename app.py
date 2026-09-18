@@ -275,6 +275,22 @@ def initialise_database():
         )
     """)
 
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS notifications (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            recipient_employee_no TEXT NOT NULL,
+            jv_id INTEGER,
+            jv_number TEXT,
+            notification_type TEXT NOT NULL,
+            title TEXT NOT NULL,
+            message TEXT NOT NULL,
+            is_read INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            read_at TEXT,
+            FOREIGN KEY(jv_id) REFERENCES jv_headers(id)
+        )
+    """)
+
     # Safe migration for databases created by an earlier prototype version.
     header_columns = [
         row[1]
@@ -647,6 +663,136 @@ def render_attachments(jv_id, status, legacy_attachment_names=None):
                 )
             else:
                 st.error("File unavailable")
+
+
+def add_notification(
+    recipient_employee_no,
+    title,
+    message,
+    notification_type,
+    jv_id=None,
+    jv_number=None
+):
+    conn = get_connection()
+
+    conn.execute("""
+        INSERT INTO notifications (
+            recipient_employee_no,
+            jv_id,
+            jv_number,
+            notification_type,
+            title,
+            message,
+            is_read,
+            created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, 0, ?)
+    """, (
+        recipient_employee_no,
+        jv_id,
+        jv_number,
+        notification_type,
+        title,
+        message,
+        datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    ))
+
+    conn.commit()
+    conn.close()
+
+
+def notify_active_role(
+    role_name,
+    title,
+    message,
+    notification_type,
+    jv_id=None,
+    jv_number=None,
+    exclude_employee_no=None
+):
+    conn = get_connection()
+
+    rows = conn.execute("""
+        SELECT employee_no
+        FROM users
+        WHERE role = ?
+        AND status = 'ACTIVE'
+    """, (
+        role_name,
+    )).fetchall()
+
+    conn.close()
+
+    for row in rows:
+        recipient = row[0]
+
+        if exclude_employee_no and recipient == exclude_employee_no:
+            continue
+
+        add_notification(
+            recipient,
+            title,
+            message,
+            notification_type,
+            jv_id,
+            jv_number
+        )
+
+
+def unread_notification_count(employee_no):
+    conn = get_connection()
+
+    count = conn.execute("""
+        SELECT COUNT(*)
+        FROM notifications
+        WHERE recipient_employee_no = ?
+        AND is_read = 0
+    """, (
+        employee_no,
+    )).fetchone()[0]
+
+    conn.close()
+    return count
+
+
+def mark_notification_read(notification_id, employee_no):
+    conn = get_connection()
+
+    conn.execute("""
+        UPDATE notifications
+        SET
+            is_read = 1,
+            read_at = ?
+        WHERE id = ?
+        AND recipient_employee_no = ?
+    """, (
+        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        notification_id,
+        employee_no
+    ))
+
+    conn.commit()
+    conn.close()
+
+
+def mark_all_notifications_read(employee_no):
+    conn = get_connection()
+
+    conn.execute("""
+        UPDATE notifications
+        SET
+            is_read = 1,
+            read_at = ?
+        WHERE recipient_employee_no = ?
+        AND is_read = 0
+    """, (
+        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        employee_no
+    ))
+
+    conn.commit()
+    conn.close()
+
 
 def display_date(value):
 
@@ -1042,6 +1188,16 @@ def save_jv(
         "Submitted for approval."
     )
 
+    notify_active_role(
+        "APPROVER",
+        f"JV awaiting approval: {jv_number}",
+        f"{employee_name} submitted {jv_number} for approval.",
+        "JV_SUBMITTED",
+        jv_id,
+        jv_number,
+        exclude_employee_no=employee_no
+    )
+
     return jv_id
 
 
@@ -1435,6 +1591,16 @@ def update_and_resubmit_jv(
         employee_name,
         "PREPARER",
         f"Amended and resubmitted. Revision {new_revision}."
+    )
+
+    notify_active_role(
+        "APPROVER",
+        f"JV resubmitted: {jv_number}",
+        f"{employee_name} amended and resubmitted {jv_number}.",
+        "JV_RESUBMITTED",
+        jv_id,
+        jv_number,
+        exclude_employee_no=employee_no
     )
 
     return new_revision
@@ -2229,6 +2395,7 @@ with st.sidebar:
             "Dashboard",
             "Create New JV",
             "My JVs",
+            "Notifications",
             "New PIC Request"
         ]
 
@@ -2238,6 +2405,7 @@ with st.sidebar:
             "Dashboard",
             "Approval Inbox",
             "Search JVs",
+            "Notifications",
             "New PIC Request"
         ]
 
@@ -2264,6 +2432,15 @@ with st.sidebar:
         menu_options = [
             "Dashboard"
         ]
+
+    if role in ["PREPARER", "APPROVER"]:
+        unread_count = unread_notification_count(employee_no)
+
+        if unread_count > 0:
+            st.caption(
+                f"🔔 {unread_count} unread notification"
+                f"{'s' if unread_count != 1 else ''}"
+            )
 
     selected_page = st.radio(
         "Navigation",
@@ -3653,6 +3830,16 @@ elif st.session_state.page == "Approval Inbox":
                         comments
                     )
 
+                    add_notification(
+                        preparer_no,
+                        f"Amendment required: {selected_jv_number}",
+                        f"{selected_jv_number} was returned by {user_name}. "
+                        f"Reviewer comment: {comments}",
+                        "JV_RETURNED",
+                        selected_jv_id,
+                        selected_jv_number
+                    )
+
                     st.success(
                         f"{selected_jv_number} returned."
                     )
@@ -3716,6 +3903,15 @@ elif st.session_state.page == "Approval Inbox":
                         user_name,
                         role,
                         comments
+                    )
+
+                    add_notification(
+                        preparer_no,
+                        f"JV approved: {selected_jv_number}",
+                        f"{selected_jv_number} was approved by {user_name}.",
+                        "JV_APPROVED",
+                        selected_jv_id,
+                        selected_jv_number
                     )
 
                     st.success(
@@ -4230,6 +4426,134 @@ elif st.session_state.page == "Audit Trail":
                         st.rerun()
 
                 st.divider()
+
+
+# =========================================================
+# NOTIFICATIONS
+# =========================================================
+
+elif st.session_state.page == "Notifications":
+
+    if role not in [
+        "PREPARER",
+        "APPROVER"
+    ]:
+        st.error(
+            "Access denied."
+        )
+        st.stop()
+
+    st.header(
+        "Notifications"
+    )
+
+    conn = get_connection()
+
+    notification_rows = conn.execute("""
+        SELECT
+            id,
+            jv_number,
+            notification_type,
+            title,
+            message,
+            is_read,
+            created_at
+        FROM notifications
+        WHERE recipient_employee_no = ?
+        ORDER BY id DESC
+        LIMIT 100
+    """, (
+        employee_no,
+    )).fetchall()
+
+    conn.close()
+
+    unread_count = sum(
+        1
+        for row in notification_rows
+        if row[5] == 0
+    )
+
+    c1, c2 = st.columns(
+        [3, 1]
+    )
+
+    c1.write(
+        f"**Unread: {unread_count}**"
+    )
+
+    with c2:
+
+        if st.button(
+            "Mark all as read",
+            use_container_width=True,
+            disabled=unread_count == 0
+        ):
+            mark_all_notifications_read(
+                employee_no
+            )
+            st.rerun()
+
+    st.divider()
+
+    if not notification_rows:
+
+        st.info(
+            "No notifications yet."
+        )
+
+    else:
+
+        for row in notification_rows:
+
+            (
+                notification_id,
+                jv_number,
+                notification_type,
+                title,
+                message,
+                is_read,
+                created_at
+            ) = row
+
+            icon = "🔵" if not is_read else "⚪"
+
+            c1, c2 = st.columns(
+                [5, 1]
+            )
+
+            with c1:
+
+                st.write(
+                    f"{icon} **{title}**"
+                )
+
+                st.write(
+                    message
+                )
+
+                st.caption(
+                    display_datetime(created_at)
+                )
+
+            with c2:
+
+                if not is_read:
+
+                    if st.button(
+                        "Mark read",
+                        key=f"read_notification_{notification_id}",
+                        use_container_width=True
+                    ):
+
+                        mark_notification_read(
+                            notification_id,
+                            employee_no
+                        )
+
+                        st.rerun()
+
+            st.divider()
 
 
 # =========================================================
