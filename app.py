@@ -2468,6 +2468,444 @@ def render_draft_controls(jv_id, employee_no, employee_name):
             st.rerun()
 
 
+
+def month_has_been_submitted(accounting_period, employee_no):
+    period = period_key(accounting_period)
+
+    conn = get_connection()
+    row = conn.execute("""
+        SELECT 1
+        FROM monthly_submissions
+        WHERE accounting_period = ?
+        AND submitted_by = ?
+        LIMIT 1
+    """, (
+        period,
+        employee_no
+    )).fetchone()
+    conn.close()
+
+    return row is not None
+
+
+def get_month_submission_summary(accounting_period, employee_no):
+    period = period_key(accounting_period)
+
+    conn = get_connection()
+    rows = conn.execute("""
+        SELECT status, COUNT(*)
+        FROM jv_headers
+        WHERE accounting_period = ?
+        AND prepared_by = ?
+        AND status != 'CANCELLED'
+        GROUP BY status
+    """, (
+        period,
+        employee_no
+    )).fetchall()
+    conn.close()
+
+    counts = {
+        status: count
+        for status, count in rows
+    }
+
+    total = sum(counts.values())
+
+    if total == 0:
+        return counts, "NO JV"
+
+    already_submitted = month_has_been_submitted(
+        period,
+        employee_no
+    )
+
+    if not already_submitted:
+        if counts.get("DRAFT", 0) > 0:
+            month_status = "IN PROGRESS"
+        elif counts.get("READY", 0) > 0:
+            month_status = "READY FOR SUBMISSION"
+        else:
+            month_status = "IN PROGRESS"
+
+        return counts, month_status
+
+    if counts.get("AMENDMENT REQUIRED", 0) > 0:
+        month_status = "AMENDMENT REQUIRED"
+
+    elif (
+        counts.get("PENDING APPROVAL", 0) > 0
+        or counts.get("RESUBMITTED", 0) > 0
+    ):
+        approved_total = (
+            counts.get("APPROVED", 0)
+            + counts.get("POSTED TO UBS", 0)
+        )
+
+        if approved_total > 0:
+            month_status = "PARTIALLY APPROVED"
+        else:
+            month_status = "PENDING APPROVAL"
+
+    else:
+        final_total = (
+            counts.get("APPROVED", 0)
+            + counts.get("POSTED TO UBS", 0)
+        )
+
+        if final_total == total:
+            month_status = "COMPLETED"
+        else:
+            month_status = "SUBMITTED"
+
+    return counts, month_status
+
+
+def save_new_working_jv(
+    jv_number,
+    jv_type,
+    accounting_period,
+    remarks,
+    journal_df,
+    total_debit,
+    total_credit,
+    uploaded_files,
+    employee_no,
+    employee_name,
+    ready_for_month
+):
+    period = period_key(accounting_period)
+
+    if not is_period_open(period):
+        raise PermissionError(
+            f"{month_label(period)} is CLOSED."
+        )
+
+    if month_has_been_submitted(period, employee_no):
+        raise PermissionError(
+            f"{month_label(period)} has already been submitted for approval."
+        )
+
+    status = "READY" if ready_for_month else "DRAFT"
+
+    attachment_names = [
+        file.name
+        for file in (uploaded_files or [])
+    ]
+
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        INSERT INTO jv_headers (
+            jv_number,
+            jv_type,
+            accounting_period,
+            remarks,
+            status,
+            total_debit,
+            total_credit,
+            prepared_by,
+            prepared_name,
+            created_at,
+            submitted_at,
+            attachment_names
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+    """, (
+        jv_number,
+        jv_type,
+        period,
+        remarks,
+        status,
+        float(total_debit or 0),
+        float(total_credit or 0),
+        employee_no,
+        employee_name,
+        now,
+        json.dumps(attachment_names)
+    ))
+
+    jv_id = cursor.lastrowid
+
+    write_jv_lines(
+        cursor,
+        jv_id,
+        journal_df
+    )
+
+    conn.commit()
+    conn.close()
+
+    store_uploaded_files(
+        jv_id,
+        jv_number,
+        uploaded_files,
+        1,
+        employee_no,
+        employee_name
+    )
+
+    add_audit_log(
+        jv_id,
+        jv_number,
+        "JV_SAVED",
+        employee_no,
+        employee_name,
+        "PREPARER",
+        f"JV saved with status {status}."
+    )
+
+    return jv_id, status
+
+
+def update_working_jv(
+    jv_id,
+    jv_type,
+    remarks,
+    journal_df,
+    total_debit,
+    total_credit,
+    uploaded_files,
+    employee_no,
+    employee_name,
+    ready_for_month
+):
+    conn = get_connection()
+    row = conn.execute("""
+        SELECT
+            jv_number,
+            accounting_period,
+            prepared_by,
+            status,
+            attachment_names
+        FROM jv_headers
+        WHERE id = ?
+    """, (
+        jv_id,
+    )).fetchone()
+    conn.close()
+
+    if not row:
+        raise ValueError("JV not found.")
+
+    (
+        jv_number,
+        accounting_period,
+        prepared_by,
+        current_status,
+        attachment_names
+    ) = row
+
+    if prepared_by != employee_no:
+        raise PermissionError(
+            "Only the original preparer can edit this JV."
+        )
+
+    if current_status not in ("DRAFT", "READY"):
+        raise PermissionError(
+            "This JV is no longer available for working changes."
+        )
+
+    if not is_period_open(accounting_period):
+        raise PermissionError(
+            f"{month_label(accounting_period)} is CLOSED."
+        )
+
+    if month_has_been_submitted(accounting_period, employee_no):
+        raise PermissionError(
+            "This month has already been submitted for approval."
+        )
+
+    new_status = "READY" if ready_for_month else "DRAFT"
+
+    try:
+        names = json.loads(attachment_names or "[]")
+    except:
+        names = []
+
+    for file in (uploaded_files or []):
+        if file.name not in names:
+            names.append(file.name)
+
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        UPDATE jv_headers
+        SET
+            jv_type = ?,
+            remarks = ?,
+            status = ?,
+            total_debit = ?,
+            total_credit = ?,
+            attachment_names = ?
+        WHERE id = ?
+    """, (
+        jv_type,
+        remarks,
+        new_status,
+        float(total_debit or 0),
+        float(total_credit or 0),
+        json.dumps(names),
+        jv_id
+    ))
+
+    write_jv_lines(
+        cursor,
+        jv_id,
+        journal_df
+    )
+
+    conn.commit()
+    conn.close()
+
+    store_uploaded_files(
+        jv_id,
+        jv_number,
+        uploaded_files,
+        1,
+        employee_no,
+        employee_name
+    )
+
+    add_audit_log(
+        jv_id,
+        jv_number,
+        "JV_SAVED",
+        employee_no,
+        employee_name,
+        "PREPARER",
+        f"JV updated with status {new_status}."
+    )
+
+    return new_status
+
+
+def submit_monthly_batch(
+    accounting_period,
+    employee_no,
+    employee_name
+):
+    period = period_key(accounting_period)
+
+    if not is_period_open(period):
+        raise PermissionError(
+            f"{month_label(period)} is CLOSED."
+        )
+
+    if month_has_been_submitted(period, employee_no):
+        raise PermissionError(
+            "This month has already been submitted for approval."
+        )
+
+    conn = get_connection()
+
+    rows = conn.execute("""
+        SELECT
+            id,
+            jv_number,
+            status
+        FROM jv_headers
+        WHERE accounting_period = ?
+        AND prepared_by = ?
+        AND status != 'CANCELLED'
+        ORDER BY id
+    """, (
+        period,
+        employee_no
+    )).fetchall()
+
+    if not rows:
+        conn.close()
+        raise ValueError(
+            "No JV records found for this accounting month."
+        )
+
+    invalid = [
+        (jv_number, status)
+        for _, jv_number, status in rows
+        if status != "READY"
+    ]
+
+    if invalid:
+        conn.close()
+
+        summary = ", ".join(
+            f"{jv_number} ({status})"
+            for jv_number, status in invalid[:5]
+        )
+
+        raise PermissionError(
+            "Monthly submission is allowed only when every active JV is READY. "
+            f"Please check: {summary}"
+        )
+
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        INSERT INTO monthly_submissions (
+            accounting_period,
+            submitted_by,
+            submitted_name,
+            jv_count,
+            submitted_at
+        )
+        VALUES (?, ?, ?, ?, ?)
+    """, (
+        period,
+        employee_no,
+        employee_name,
+        len(rows),
+        now
+    ))
+
+    batch_id = cursor.lastrowid
+
+    cursor.execute("""
+        UPDATE jv_headers
+        SET
+            status = 'PENDING APPROVAL',
+            submitted_at = ?
+        WHERE accounting_period = ?
+        AND prepared_by = ?
+        AND status = 'READY'
+    """, (
+        now,
+        period,
+        employee_no
+    ))
+
+    conn.commit()
+    conn.close()
+
+    for jv_id, jv_number, _ in rows:
+        add_audit_log(
+            jv_id,
+            jv_number,
+            "JV_SUBMITTED",
+            employee_no,
+            employee_name,
+            "PREPARER",
+            f"Submitted as part of {month_label(period)} monthly JV batch."
+        )
+
+    notify_active_role(
+        "APPROVER",
+        f"Monthly JV submission: {month_label(period)}",
+        f"{employee_name} submitted {len(rows)} JV(s) for {month_label(period)}.",
+        "MONTHLY_JV_SUBMITTED",
+        None,
+        None,
+        exclude_employee_no=employee_no
+    )
+
+    return batch_id, len(rows)
+
+
 def update_and_resubmit_jv(
     jv_id,
     jv_type,
