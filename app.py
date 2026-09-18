@@ -291,6 +291,36 @@ def initialise_database():
         )
     """)
 
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS gl_master (
+            gl_code TEXT PRIMARY KEY,
+            gl_description TEXT NOT NULL,
+            account_category TEXT NOT NULL,
+            normal_balance TEXT,
+            status TEXT NOT NULL DEFAULT 'ACTIVE',
+            effective_date TEXT,
+            entity TEXT NOT NULL DEFAULT 'JKPSD',
+            cost_centre_required INTEGER NOT NULL DEFAULT 0,
+            validation_notes TEXT,
+            created_by TEXT,
+            created_at TEXT NOT NULL,
+            updated_by TEXT,
+            updated_at TEXT NOT NULL
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS gl_master_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            gl_code TEXT NOT NULL,
+            action TEXT NOT NULL,
+            snapshot_json TEXT NOT NULL,
+            changed_by TEXT NOT NULL,
+            changed_name TEXT NOT NULL,
+            changed_at TEXT NOT NULL
+        )
+    """)
+
     # Safe migration for databases created by an earlier prototype version.
     header_columns = [
         row[1]
@@ -791,6 +821,191 @@ def mark_all_notifications_read(employee_no):
     ))
 
     conn.commit()
+    conn.close()
+
+
+
+def seed_gl_master():
+    """Seed current prototype G/Ls only when the database master is empty."""
+    conn = get_connection()
+
+    count = conn.execute(
+        "SELECT COUNT(*) FROM gl_master"
+    ).fetchone()[0]
+
+    if count == 0:
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        for code, details in GL_MASTER.items():
+            category = details.get("category", "Other")
+
+            normal_balance = (
+                "DEBIT"
+                if category in ("Asset", "Expense", "Investment")
+                else "CREDIT"
+            )
+
+            conn.execute("""
+                INSERT INTO gl_master (
+                    gl_code,
+                    gl_description,
+                    account_category,
+                    normal_balance,
+                    status,
+                    effective_date,
+                    entity,
+                    cost_centre_required,
+                    validation_notes,
+                    created_by,
+                    created_at,
+                    updated_by,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, 'ACTIVE', ?, 'JKPSD', 0, '', 'SYSTEM', ?, 'SYSTEM', ?)
+            """, (
+                code,
+                details["description"],
+                category,
+                normal_balance,
+                date.today().strftime("%Y-%m-%d"),
+                now,
+                now
+            ))
+
+    conn.commit()
+    conn.close()
+
+
+def get_gl_options(include_inactive=False):
+    conn = get_connection()
+
+    if include_inactive:
+        rows = conn.execute("""
+            SELECT gl_code, gl_description, status
+            FROM gl_master
+            WHERE entity = 'JKPSD'
+            ORDER BY gl_code
+        """).fetchall()
+    else:
+        rows = conn.execute("""
+            SELECT gl_code, gl_description, status
+            FROM gl_master
+            WHERE entity = 'JKPSD'
+            AND status = 'ACTIVE'
+            ORDER BY gl_code
+        """).fetchall()
+
+    conn.close()
+
+    options = []
+
+    for gl_code, description, status in rows:
+        label = f"{gl_code} - {description}"
+
+        if include_inactive and status != "ACTIVE":
+            label += " [INACTIVE]"
+
+        options.append(label)
+
+    return options
+
+
+def parse_gl_code(selected_value):
+    if selected_value is None or pd.isna(selected_value):
+        return ""
+
+    value = str(selected_value)
+
+    if " - " in value:
+        return value.split(" - ", 1)[0].strip()
+
+    return value.replace(" [INACTIVE]", "").strip()
+
+
+def gl_is_active(selected_value):
+    gl_code = parse_gl_code(selected_value)
+
+    if not gl_code:
+        return False
+
+    conn = get_connection()
+
+    row = conn.execute("""
+        SELECT status
+        FROM gl_master
+        WHERE gl_code = ?
+        AND entity = 'JKPSD'
+    """, (
+        gl_code,
+    )).fetchone()
+
+    conn.close()
+
+    return bool(row and row[0] == "ACTIVE")
+
+
+def log_gl_history(gl_code, action, employee_no, employee_name):
+    conn = get_connection()
+
+    row = conn.execute("""
+        SELECT
+            gl_code,
+            gl_description,
+            account_category,
+            normal_balance,
+            status,
+            effective_date,
+            entity,
+            cost_centre_required,
+            validation_notes,
+            created_by,
+            created_at,
+            updated_by,
+            updated_at
+        FROM gl_master
+        WHERE gl_code = ?
+    """, (
+        gl_code,
+    )).fetchone()
+
+    if row:
+        snapshot = {
+            "gl_code": row[0],
+            "gl_description": row[1],
+            "account_category": row[2],
+            "normal_balance": row[3],
+            "status": row[4],
+            "effective_date": row[5],
+            "entity": row[6],
+            "cost_centre_required": row[7],
+            "validation_notes": row[8],
+            "created_by": row[9],
+            "created_at": row[10],
+            "updated_by": row[11],
+            "updated_at": row[12]
+        }
+
+        conn.execute("""
+            INSERT INTO gl_master_history (
+                gl_code,
+                action,
+                snapshot_json,
+                changed_by,
+                changed_name,
+                changed_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (
+            gl_code,
+            action,
+            json.dumps(snapshot),
+            employee_no,
+            employee_name,
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        ))
+
+        conn.commit()
+
     conn.close()
 
 
@@ -1381,6 +1596,11 @@ def validate_journal(journal_df):
         if pd.isna(row["A/C Code"]):
             errors.append(f"Line {position}: A/C Code required.")
 
+        elif not gl_is_active(row["A/C Code"]):
+            errors.append(
+                f"Line {position}: A/C Code is inactive or invalid."
+            )
+
         if str(row["Description"]).strip() == "":
             errors.append(f"Line {position}: Description required.")
 
@@ -1725,7 +1945,7 @@ def render_amendment_controls(jv_id, employee_no, employee_name):
             ),
             "A/C Code": st.column_config.SelectboxColumn(
                 "A/C Code",
-                options=GL_OPTIONS
+                options=get_gl_options(include_inactive=True)
             ),
             "Description": st.column_config.TextColumn(
                 "Description",
@@ -2318,6 +2538,9 @@ def logout():
 seed_demo_users()
 
 
+seed_gl_master()
+
+
 # =========================================================
 # LOGIN SCREEN
 # =========================================================
@@ -2725,9 +2948,16 @@ if st.session_state.page == "Dashboard":
             active_user_count
         )
 
+        active_gl_count = conn.execute("""
+            SELECT COUNT(*)
+            FROM gl_master
+            WHERE entity = 'JKPSD'
+            AND status = 'ACTIVE'
+        """).fetchone()[0]
+
         c2.metric(
             "Active G/L Codes",
-            len(GL_MASTER)
+            active_gl_count
         )
 
         configured_open_periods = conn.execute("""
@@ -3285,7 +3515,7 @@ elif st.session_state.page == "Create New JV":
             ),
             "A/C Code": st.column_config.SelectboxColumn(
                 "A/C Code",
-                options=GL_OPTIONS
+                options=get_gl_options(include_inactive=False)
             ),
             "Description": st.column_config.TextColumn(
                 "Description",
@@ -3424,6 +3654,12 @@ elif st.session_state.page == "Create New JV":
 
             errors.append(
                 f"Line {line_no}: A/C Code required."
+            )
+
+        elif not gl_is_active(row["A/C Code"]):
+
+            errors.append(
+                f"Line {line_no}: A/C Code is inactive or invalid."
             )
 
         if str(
@@ -4949,22 +5185,511 @@ elif st.session_state.page == "G/L Master":
         "G/L Master"
     )
 
-    gl_rows = []
-
-    for code, details in GL_MASTER.items():
-
-        gl_rows.append({
-            "A/C Code": code,
-            "Description": details["description"],
-            "Category": details["category"],
-            "Status": "ACTIVE"
-        })
-
-    st.dataframe(
-        pd.DataFrame(gl_rows),
-        use_container_width=True,
-        hide_index=True
+    st.caption(
+        "Only ACTIVE G/L codes are available for new Journal Vouchers."
     )
+
+    tab1, tab2, tab3 = st.tabs(
+        [
+            "G/L List",
+            "Add / Update G/L",
+            "Change History"
+        ]
+    )
+
+    # -----------------------------------------------------
+    # G/L LIST
+    # -----------------------------------------------------
+
+    with tab1:
+
+        c1, c2 = st.columns(2)
+
+        with c1:
+
+            status_filter = st.selectbox(
+                "Status",
+                [
+                    "ALL",
+                    "ACTIVE",
+                    "INACTIVE"
+                ],
+                key="gl_status_filter"
+            )
+
+        with c2:
+
+            search_gl = st.text_input(
+                "Search Code / Description",
+                key="gl_search"
+            )
+
+        conn = get_connection()
+
+        query = """
+            SELECT
+                gl_code AS "G/L Code",
+                gl_description AS "G/L Description",
+                account_category AS "Account Category",
+                normal_balance AS "Normal Balance",
+                status AS "Status",
+                effective_date AS "Effective Date",
+                entity AS "Entity",
+                CASE
+                    WHEN cost_centre_required = 1 THEN 'Yes'
+                    ELSE 'No'
+                END AS "Cost Centre Required",
+                validation_notes AS "Validation Notes"
+            FROM gl_master
+            WHERE entity = 'JKPSD'
+        """
+
+        params = []
+
+        if status_filter != "ALL":
+            query += " AND status = ?"
+            params.append(status_filter)
+
+        if search_gl.strip():
+            query += """
+                AND (
+                    gl_code LIKE ?
+                    OR gl_description LIKE ?
+                )
+            """
+            search_value = f"%{search_gl.strip()}%"
+            params.extend([
+                search_value,
+                search_value
+            ])
+
+        query += " ORDER BY gl_code"
+
+        gl_df = pd.read_sql_query(
+            query,
+            conn,
+            params=params
+        )
+
+        conn.close()
+
+        if not gl_df.empty:
+            gl_df["Effective Date"] = gl_df["Effective Date"].apply(
+                display_date
+            )
+
+        st.dataframe(
+            gl_df,
+            use_container_width=True,
+            hide_index=True
+        )
+
+    # -----------------------------------------------------
+    # ADD / UPDATE
+    # -----------------------------------------------------
+
+    with tab2:
+
+        mode = st.radio(
+            "Action",
+            [
+                "Add New G/L",
+                "Update Existing G/L"
+            ],
+            horizontal=True
+        )
+
+        categories = [
+            "Asset",
+            "Liability",
+            "Equity",
+            "Income",
+            "Expense",
+            "Investment",
+            "Other"
+        ]
+
+        if mode == "Add New G/L":
+
+            gl_code = st.text_input(
+                "G/L Code",
+                key="new_gl_code"
+            )
+
+            gl_description = st.text_input(
+                "G/L Description",
+                key="new_gl_description"
+            )
+
+            c1, c2 = st.columns(2)
+
+            with c1:
+
+                category = st.selectbox(
+                    "Account Category",
+                    categories,
+                    key="new_gl_category"
+                )
+
+                normal_balance = st.selectbox(
+                    "Debit / Credit Classification",
+                    [
+                        "DEBIT",
+                        "CREDIT"
+                    ],
+                    key="new_gl_balance"
+                )
+
+            with c2:
+
+                effective_date = st.date_input(
+                    "Effective Date",
+                    key="new_gl_effective"
+                )
+
+                cost_centre_required = st.checkbox(
+                    "Cost Centre Required",
+                    key="new_gl_cc"
+                )
+
+            validation_notes = st.text_area(
+                "Additional Validation Notes",
+                key="new_gl_notes"
+            )
+
+            if st.button(
+                "Add G/L",
+                type="primary",
+                key="add_gl_button"
+            ):
+
+                clean_code = gl_code.strip()
+                clean_description = gl_description.strip()
+
+                if not clean_code:
+
+                    st.error(
+                        "G/L Code is required."
+                    )
+
+                elif not clean_description:
+
+                    st.error(
+                        "G/L Description is required."
+                    )
+
+                else:
+
+                    conn = get_connection()
+
+                    exists = conn.execute(
+                        "SELECT 1 FROM gl_master WHERE gl_code = ?",
+                        (clean_code,)
+                    ).fetchone()
+
+                    if exists:
+
+                        conn.close()
+
+                        st.error(
+                            "This G/L Code already exists."
+                        )
+
+                    else:
+
+                        now = datetime.now().strftime(
+                            "%Y-%m-%d %H:%M:%S"
+                        )
+
+                        conn.execute("""
+                            INSERT INTO gl_master (
+                                gl_code,
+                                gl_description,
+                                account_category,
+                                normal_balance,
+                                status,
+                                effective_date,
+                                entity,
+                                cost_centre_required,
+                                validation_notes,
+                                created_by,
+                                created_at,
+                                updated_by,
+                                updated_at
+                            )
+                            VALUES (?, ?, ?, ?, 'ACTIVE', ?, 'JKPSD', ?, ?, ?, ?, ?, ?)
+                        """, (
+                            clean_code,
+                            clean_description,
+                            category,
+                            normal_balance,
+                            effective_date.strftime("%Y-%m-%d"),
+                            1 if cost_centre_required else 0,
+                            validation_notes.strip(),
+                            employee_no,
+                            now,
+                            employee_no,
+                            now
+                        ))
+
+                        conn.commit()
+                        conn.close()
+
+                        log_gl_history(
+                            clean_code,
+                            "CREATED",
+                            employee_no,
+                            user_name
+                        )
+
+                        st.success(
+                            f"G/L {clean_code} created and activated."
+                        )
+
+                        st.rerun()
+
+        else:
+
+            conn = get_connection()
+
+            existing_rows = conn.execute("""
+                SELECT
+                    gl_code,
+                    gl_description,
+                    account_category,
+                    normal_balance,
+                    status,
+                    effective_date,
+                    cost_centre_required,
+                    validation_notes
+                FROM gl_master
+                WHERE entity = 'JKPSD'
+                ORDER BY gl_code
+            """).fetchall()
+
+            conn.close()
+
+            if not existing_rows:
+
+                st.info(
+                    "No G/L records available."
+                )
+
+            else:
+
+                selected_code = st.selectbox(
+                    "Select G/L",
+                    [
+                        row[0]
+                        for row in existing_rows
+                    ],
+                    key="edit_gl_select"
+                )
+
+                selected = next(
+                    row
+                    for row in existing_rows
+                    if row[0] == selected_code
+                )
+
+                (
+                    _,
+                    current_description,
+                    current_category,
+                    current_balance,
+                    current_status,
+                    current_effective_date,
+                    current_cc_required,
+                    current_notes
+                ) = selected
+
+                try:
+                    effective_default = datetime.strptime(
+                        current_effective_date,
+                        "%Y-%m-%d"
+                    ).date()
+                except:
+                    effective_default = date.today()
+
+                gl_description = st.text_input(
+                    "G/L Description",
+                    value=current_description,
+                    key=f"edit_gl_desc_{selected_code}"
+                )
+
+                c1, c2 = st.columns(2)
+
+                with c1:
+
+                    category_index = (
+                        categories.index(current_category)
+                        if current_category in categories
+                        else len(categories) - 1
+                    )
+
+                    category = st.selectbox(
+                        "Account Category",
+                        categories,
+                        index=category_index,
+                        key=f"edit_gl_category_{selected_code}"
+                    )
+
+                    balance_options = [
+                        "DEBIT",
+                        "CREDIT"
+                    ]
+
+                    balance_index = (
+                        balance_options.index(current_balance)
+                        if current_balance in balance_options
+                        else 0
+                    )
+
+                    normal_balance = st.selectbox(
+                        "Debit / Credit Classification",
+                        balance_options,
+                        index=balance_index,
+                        key=f"edit_gl_balance_{selected_code}"
+                    )
+
+                with c2:
+
+                    effective_date = st.date_input(
+                        "Effective Date",
+                        value=effective_default,
+                        key=f"edit_gl_effective_{selected_code}"
+                    )
+
+                    status = st.selectbox(
+                        "Status",
+                        [
+                            "ACTIVE",
+                            "INACTIVE"
+                        ],
+                        index=0 if current_status == "ACTIVE" else 1,
+                        key=f"edit_gl_status_{selected_code}"
+                    )
+
+                    cost_centre_required = st.checkbox(
+                        "Cost Centre Required",
+                        value=bool(current_cc_required),
+                        key=f"edit_gl_cc_{selected_code}"
+                    )
+
+                validation_notes = st.text_area(
+                    "Additional Validation Notes",
+                    value=current_notes or "",
+                    key=f"edit_gl_notes_{selected_code}"
+                )
+
+                if st.button(
+                    "Save G/L Changes",
+                    type="primary",
+                    key=f"save_gl_{selected_code}"
+                ):
+
+                    if not gl_description.strip():
+
+                        st.error(
+                            "G/L Description is required."
+                        )
+
+                    else:
+
+                        log_gl_history(
+                            selected_code,
+                            "BEFORE_UPDATE",
+                            employee_no,
+                            user_name
+                        )
+
+                        now = datetime.now().strftime(
+                            "%Y-%m-%d %H:%M:%S"
+                        )
+
+                        conn = get_connection()
+
+                        conn.execute("""
+                            UPDATE gl_master
+                            SET
+                                gl_description = ?,
+                                account_category = ?,
+                                normal_balance = ?,
+                                status = ?,
+                                effective_date = ?,
+                                cost_centre_required = ?,
+                                validation_notes = ?,
+                                updated_by = ?,
+                                updated_at = ?
+                            WHERE gl_code = ?
+                        """, (
+                            gl_description.strip(),
+                            category,
+                            normal_balance,
+                            status,
+                            effective_date.strftime("%Y-%m-%d"),
+                            1 if cost_centre_required else 0,
+                            validation_notes.strip(),
+                            employee_no,
+                            now,
+                            selected_code
+                        ))
+
+                        conn.commit()
+                        conn.close()
+
+                        log_gl_history(
+                            selected_code,
+                            "AFTER_UPDATE",
+                            employee_no,
+                            user_name
+                        )
+
+                        st.success(
+                            f"G/L {selected_code} updated."
+                        )
+
+                        st.rerun()
+
+    # -----------------------------------------------------
+    # HISTORY
+    # -----------------------------------------------------
+
+    with tab3:
+
+        conn = get_connection()
+
+        history_df = pd.read_sql_query("""
+            SELECT
+                gl_code AS "G/L Code",
+                action AS "Action",
+                changed_by AS "Employee No.",
+                changed_name AS "Changed By",
+                changed_at AS "Changed At"
+            FROM gl_master_history
+            ORDER BY id DESC
+            LIMIT 100
+        """, conn)
+
+        conn.close()
+
+        if history_df.empty:
+
+            st.info(
+                "No G/L Master changes recorded yet."
+            )
+
+        else:
+
+            history_df["Changed At"] = history_df["Changed At"].apply(
+                display_datetime
+            )
+
+            st.dataframe(
+                history_df,
+                use_container_width=True,
+                hide_index=True
+            )
 
 
 elif st.session_state.page == "JV Type Master":
