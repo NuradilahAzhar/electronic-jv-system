@@ -3981,26 +3981,81 @@ with st.sidebar:
 
     st.divider()
 
+    # -----------------------------------------------------
+    # ACTION-ORIENTED NAVIGATION
+    # Notifications remain in the database for system/audit use,
+    # but there is no separate Notifications inbox in the sidebar.
+    # -----------------------------------------------------
+
+    nav_label_to_page = {}
+
     if role == "PREPARER":
+
+        conn = get_connection()
+        amendment_badge_count = conn.execute("""
+            SELECT COUNT(*)
+            FROM jv_headers
+            WHERE prepared_by = ?
+            AND status = 'AMENDMENT REQUIRED'
+        """, (
+            employee_no,
+        )).fetchone()[0]
+        conn.close()
+
+        my_jvs_label = (
+            f"My JVs ({amendment_badge_count})"
+            if amendment_badge_count > 0
+            else "My JVs"
+        )
 
         menu_options = [
             "Dashboard",
             "Create / Save JV",
             "Monthly Workspace",
-            "My JVs",
-            "Notifications",
+            my_jvs_label,
             "New PIC Request"
         ]
+
+        nav_label_to_page = {
+            "Dashboard": "Dashboard",
+            "Create / Save JV": "Create / Save JV",
+            "Monthly Workspace": "Monthly Workspace",
+            my_jvs_label: "My JVs",
+            "New PIC Request": "New PIC Request"
+        }
 
     elif role == "APPROVER":
 
+        conn = get_connection()
+        approval_badge_count = conn.execute("""
+            SELECT COUNT(*)
+            FROM jv_headers
+            WHERE status IN (
+                'PENDING APPROVAL',
+                'RESUBMITTED'
+            )
+        """).fetchone()[0]
+        conn.close()
+
+        approval_label = (
+            f"Approval Inbox ({approval_badge_count})"
+            if approval_badge_count > 0
+            else "Approval Inbox"
+        )
+
         menu_options = [
             "Dashboard",
-            "Approval Inbox",
+            approval_label,
             "Search JVs",
-            "Notifications",
             "New PIC Request"
         ]
+
+        nav_label_to_page = {
+            "Dashboard": "Dashboard",
+            approval_label: "Approval Inbox",
+            "Search JVs": "Search JVs",
+            "New PIC Request": "New PIC Request"
+        }
 
     elif role == "AUDITOR":
 
@@ -4009,6 +4064,11 @@ with st.sidebar:
             "Search JVs",
             "Audit Trail"
         ]
+
+        nav_label_to_page = {
+            option: option
+            for option in menu_options
+        }
 
     elif role == "ADMIN":
 
@@ -4020,38 +4080,53 @@ with st.sidebar:
             "Period Control"
         ]
 
+        nav_label_to_page = {
+            option: option
+            for option in menu_options
+        }
+
     else:
 
         menu_options = [
             "Dashboard"
         ]
 
-    # Apply any page change requested by a button on the previous run.
-    if st.session_state.requested_page in menu_options:
+        nav_label_to_page = {
+            "Dashboard": "Dashboard"
+        }
+
+    page_to_nav_label = {
+        page: label
+        for label, page in nav_label_to_page.items()
+    }
+
+    # Apply a page change requested by a button on the previous run.
+    if st.session_state.requested_page in page_to_nav_label:
         st.session_state.page = st.session_state.requested_page
         st.session_state.requested_page = None
         st.session_state.nav_version += 1
 
-    if role in ["PREPARER", "APPROVER"]:
-        unread_count = unread_notification_count(employee_no)
-
-        if unread_count > 0:
-            st.caption(
-                f"🔔 {unread_count} unread notification"
-                f"{'s' if unread_count != 1 else ''}"
-            )
+    current_nav_label = page_to_nav_label.get(
+        st.session_state.page,
+        menu_options[0]
+    )
 
     current_index = (
-        menu_options.index(st.session_state.page)
-        if st.session_state.page in menu_options
+        menu_options.index(current_nav_label)
+        if current_nav_label in menu_options
         else 0
     )
 
-    selected_page = st.radio(
+    selected_nav_label = st.radio(
         "Navigation",
         menu_options,
         index=current_index,
         key=f"navigation_radio_{st.session_state.nav_version}"
+    )
+
+    selected_page = nav_label_to_page.get(
+        selected_nav_label,
+        selected_nav_label
     )
 
     if selected_page != st.session_state.page:
@@ -6655,126 +6730,16 @@ elif st.session_state.page == "Audit Trail":
 
 elif st.session_state.page == "Notifications":
 
-    if role not in [
-        "PREPARER",
-        "APPROVER"
-    ]:
-        st.error(
-            "Access denied."
-        )
-        st.stop()
+    # Legacy safety redirect. Notifications are now surfaced as actionable
+    # counts in My JVs / Approval Inbox instead of a separate inbox.
+    if role == "PREPARER":
+        request_navigation("My JVs")
 
-    st.header(
-        "Notifications"
-    )
-
-    conn = get_connection()
-
-    notification_rows = conn.execute("""
-        SELECT
-            id,
-            jv_number,
-            notification_type,
-            title,
-            message,
-            is_read,
-            created_at
-        FROM notifications
-        WHERE recipient_employee_no = ?
-        ORDER BY id DESC
-        LIMIT 100
-    """, (
-        employee_no,
-    )).fetchall()
-
-    conn.close()
-
-    unread_count = sum(
-        1
-        for row in notification_rows
-        if row[5] == 0
-    )
-
-    c1, c2 = st.columns(
-        [3, 1]
-    )
-
-    c1.write(
-        f"**Unread: {unread_count}**"
-    )
-
-    with c2:
-
-        if st.button(
-            "Mark all as read",
-            use_container_width=True,
-            disabled=unread_count == 0
-        ):
-            mark_all_notifications_read(
-                employee_no
-            )
-            st.rerun()
-
-    st.divider()
-
-    if not notification_rows:
-
-        st.info(
-            "No notifications yet."
-        )
+    elif role == "APPROVER":
+        request_navigation("Approval Inbox")
 
     else:
-
-        for row in notification_rows:
-
-            (
-                notification_id,
-                jv_number,
-                notification_type,
-                title,
-                message,
-                is_read,
-                created_at
-            ) = row
-
-            icon = "🔵" if not is_read else "⚪"
-
-            c1, c2 = st.columns(
-                [5, 1]
-            )
-
-            with c1:
-
-                st.write(
-                    f"{icon} **{title}**"
-                )
-
-                st.write(
-                    message
-                )
-
-                st.caption(
-                    display_datetime(created_at)
-                )
-
-            with c2:
-
-                if not is_read:
-
-                    if st.button(
-                        "Mark read",
-                        key=f"read_notification_{notification_id}",
-                        use_container_width=True
-                    ):
-
-                        mark_notification_read(
-                            notification_id,
-                            employee_no
-                        )
-
-                        st.rerun()
-
-            st.divider()
+        request_navigation("Dashboard")
 
 
 # =========================================================
