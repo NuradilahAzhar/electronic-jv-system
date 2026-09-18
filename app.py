@@ -1830,6 +1830,781 @@ def validate_journal(journal_df):
     return errors, total_debit, total_credit
 
 
+
+def validate_journal_dates_against_period(journal_df, accounting_period):
+    """Submission control: every populated journal line date must match accounting month."""
+    errors = []
+
+    if journal_df is None or journal_df.empty:
+        return errors
+
+    period = period_key(accounting_period)
+
+    for position, (_, row) in enumerate(journal_df.iterrows(), start=1):
+        debit = float(pd.to_numeric(row.get("Dr"), errors="coerce") or 0)
+        credit = float(pd.to_numeric(row.get("Cr"), errors="coerce") or 0)
+
+        has_data = (
+            pd.notna(row.get("Date"))
+            or pd.notna(row.get("A/C Code"))
+            or str(row.get("Description", "")).strip() != ""
+            or debit > 0
+            or credit > 0
+        )
+
+        if not has_data or pd.isna(row.get("Date")):
+            continue
+
+        line_date = row.get("Date")
+
+        if hasattr(line_date, "strftime"):
+            line_period = line_date.strftime("%Y-%m")
+        else:
+            try:
+                line_period = datetime.strptime(
+                    str(line_date)[:10],
+                    "%Y-%m-%d"
+                ).strftime("%Y-%m")
+            except:
+                continue
+
+        if line_period != period:
+            errors.append(
+                f"Line {position}: Date must fall within "
+                f"{month_label(period)}."
+            )
+
+    return errors
+
+
+def write_jv_lines(cursor, jv_id, journal_df):
+    """Replace JV lines while allowing incomplete rows for Draft status."""
+    cursor.execute(
+        "DELETE FROM jv_lines WHERE jv_id = ?",
+        (jv_id,)
+    )
+
+    line_no = 1
+
+    if journal_df is None:
+        return
+
+    for _, row in journal_df.iterrows():
+
+        debit = float(
+            pd.to_numeric(
+                row.get("Dr"),
+                errors="coerce"
+            )
+            if pd.notna(row.get("Dr"))
+            else 0
+        )
+
+        credit = float(
+            pd.to_numeric(
+                row.get("Cr"),
+                errors="coerce"
+            )
+            if pd.notna(row.get("Cr"))
+            else 0
+        )
+
+        has_data = (
+            pd.notna(row.get("Date"))
+            or pd.notna(row.get("A/C Code"))
+            or str(row.get("Description", "")).strip() != ""
+            or debit > 0
+            or credit > 0
+        )
+
+        if not has_data:
+            continue
+
+        selected_gl = row.get("A/C Code")
+        gl_code = ""
+        gl_description = ""
+
+        if pd.notna(selected_gl):
+            selected_gl = str(selected_gl)
+            gl_code = parse_gl_code(selected_gl)
+
+            if " - " in selected_gl:
+                gl_description = selected_gl.split(
+                    " - ",
+                    1
+                )[1].replace(" [INACTIVE]", "").strip()
+
+        line_date = row.get("Date")
+
+        if hasattr(line_date, "strftime"):
+            line_date = line_date.strftime("%Y-%m-%d")
+        elif pd.isna(line_date):
+            line_date = ""
+        else:
+            line_date = str(line_date)
+
+        cursor.execute("""
+            INSERT INTO jv_lines (
+                jv_id,
+                line_no,
+                line_date,
+                gl_code,
+                gl_description,
+                description,
+                debit,
+                credit
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            jv_id,
+            line_no,
+            line_date,
+            gl_code,
+            gl_description,
+            str(row.get("Description", "") or ""),
+            debit,
+            credit
+        ))
+
+        line_no += 1
+
+
+def save_new_draft(
+    jv_number,
+    jv_type,
+    accounting_period,
+    remarks,
+    journal_df,
+    total_debit,
+    total_credit,
+    uploaded_files,
+    employee_no,
+    employee_name
+):
+    if not is_period_open(accounting_period):
+        raise PermissionError(
+            f"{month_label(period_key(accounting_period))} is CLOSED."
+        )
+
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    attachment_names = [
+        file.name
+        for file in (uploaded_files or [])
+    ]
+
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        INSERT INTO jv_headers (
+            jv_number,
+            jv_type,
+            accounting_period,
+            remarks,
+            status,
+            total_debit,
+            total_credit,
+            prepared_by,
+            prepared_name,
+            created_at,
+            submitted_at,
+            attachment_names
+        )
+        VALUES (?, ?, ?, ?, 'DRAFT', ?, ?, ?, ?, ?, NULL, ?)
+    """, (
+        jv_number,
+        jv_type,
+        period_key(accounting_period),
+        remarks,
+        float(total_debit or 0),
+        float(total_credit or 0),
+        employee_no,
+        employee_name,
+        now,
+        json.dumps(attachment_names)
+    ))
+
+    jv_id = cursor.lastrowid
+
+    write_jv_lines(
+        cursor,
+        jv_id,
+        journal_df
+    )
+
+    conn.commit()
+    conn.close()
+
+    store_uploaded_files(
+        jv_id,
+        jv_number,
+        uploaded_files,
+        1,
+        employee_no,
+        employee_name
+    )
+
+    add_audit_log(
+        jv_id,
+        jv_number,
+        "JV_DRAFT_SAVED",
+        employee_no,
+        employee_name,
+        "PREPARER",
+        "Draft saved."
+    )
+
+    return jv_id
+
+
+def update_existing_draft(
+    jv_id,
+    jv_type,
+    remarks,
+    journal_df,
+    total_debit,
+    total_credit,
+    uploaded_files,
+    employee_no,
+    employee_name
+):
+    conn = get_connection()
+
+    row = conn.execute("""
+        SELECT
+            jv_number,
+            accounting_period,
+            prepared_by,
+            status,
+            attachment_names
+        FROM jv_headers
+        WHERE id = ?
+    """, (
+        jv_id,
+    )).fetchone()
+
+    conn.close()
+
+    if not row:
+        raise ValueError("JV not found.")
+
+    (
+        jv_number,
+        accounting_period,
+        prepared_by,
+        status,
+        attachment_names
+    ) = row
+
+    if prepared_by != employee_no:
+        raise PermissionError(
+            "Only the original preparer can update this Draft."
+        )
+
+    if status != "DRAFT":
+        raise PermissionError(
+            "This JV is no longer a Draft."
+        )
+
+    if not is_period_open(accounting_period):
+        raise PermissionError(
+            f"{month_label(accounting_period)} is CLOSED."
+        )
+
+    try:
+        names = json.loads(attachment_names or "[]")
+    except:
+        names = []
+
+    for file in (uploaded_files or []):
+        if file.name not in names:
+            names.append(file.name)
+
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        UPDATE jv_headers
+        SET
+            jv_type = ?,
+            remarks = ?,
+            total_debit = ?,
+            total_credit = ?,
+            attachment_names = ?
+        WHERE id = ?
+    """, (
+        jv_type,
+        remarks,
+        float(total_debit or 0),
+        float(total_credit or 0),
+        json.dumps(names),
+        jv_id
+    ))
+
+    write_jv_lines(
+        cursor,
+        jv_id,
+        journal_df
+    )
+
+    conn.commit()
+    conn.close()
+
+    store_uploaded_files(
+        jv_id,
+        jv_number,
+        uploaded_files,
+        1,
+        employee_no,
+        employee_name
+    )
+
+    add_audit_log(
+        jv_id,
+        jv_number,
+        "JV_DRAFT_UPDATED",
+        employee_no,
+        employee_name,
+        "PREPARER",
+        "Draft updated."
+    )
+
+
+def submit_existing_draft(
+    jv_id,
+    jv_type,
+    remarks,
+    journal_df,
+    total_debit,
+    total_credit,
+    uploaded_files,
+    employee_no,
+    employee_name
+):
+    update_existing_draft(
+        jv_id,
+        jv_type,
+        remarks,
+        journal_df,
+        total_debit,
+        total_credit,
+        uploaded_files,
+        employee_no,
+        employee_name
+    )
+
+    conn = get_connection()
+
+    row = conn.execute("""
+        SELECT
+            jv_number,
+            accounting_period
+        FROM jv_headers
+        WHERE id = ?
+    """, (
+        jv_id,
+    )).fetchone()
+
+    if not row:
+        conn.close()
+        raise ValueError("JV not found.")
+
+    jv_number, accounting_period = row
+
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    conn.execute("""
+        UPDATE jv_headers
+        SET
+            status = 'PENDING APPROVAL',
+            submitted_at = ?
+        WHERE id = ?
+        AND status = 'DRAFT'
+    """, (
+        now,
+        jv_id
+    ))
+
+    conn.commit()
+    conn.close()
+
+    add_audit_log(
+        jv_id,
+        jv_number,
+        "JV_SUBMITTED",
+        employee_no,
+        employee_name,
+        "PREPARER",
+        "Draft submitted for approval."
+    )
+
+    notify_active_role(
+        "APPROVER",
+        f"JV awaiting approval: {jv_number}",
+        f"{employee_name} submitted {jv_number} for approval.",
+        "JV_SUBMITTED",
+        jv_id,
+        jv_number,
+        exclude_employee_no=employee_no
+    )
+
+
+def cancel_draft(jv_id, employee_no, employee_name):
+    conn = get_connection()
+
+    row = conn.execute("""
+        SELECT
+            jv_number,
+            prepared_by,
+            status
+        FROM jv_headers
+        WHERE id = ?
+    """, (
+        jv_id,
+    )).fetchone()
+
+    if not row:
+        conn.close()
+        raise ValueError("JV not found.")
+
+    jv_number, prepared_by, status = row
+
+    if prepared_by != employee_no:
+        conn.close()
+        raise PermissionError(
+            "Only the original preparer can cancel this Draft."
+        )
+
+    if status != "DRAFT":
+        conn.close()
+        raise PermissionError(
+            "Only Draft JVs can be cancelled."
+        )
+
+    conn.execute("""
+        UPDATE jv_headers
+        SET status = 'CANCELLED'
+        WHERE id = ?
+    """, (
+        jv_id,
+    ))
+
+    conn.commit()
+    conn.close()
+
+    add_audit_log(
+        jv_id,
+        jv_number,
+        "JV_CANCELLED",
+        employee_no,
+        employee_name,
+        "PREPARER",
+        "Draft cancelled."
+    )
+
+
+def render_draft_controls(jv_id, employee_no, employee_name):
+    if role != "PREPARER":
+        return
+
+    conn = get_connection()
+
+    header = conn.execute("""
+        SELECT
+            jv_number,
+            jv_type,
+            accounting_period,
+            remarks,
+            status,
+            prepared_by
+        FROM jv_headers
+        WHERE id = ?
+    """, (
+        jv_id,
+    )).fetchone()
+
+    conn.close()
+
+    if not header:
+        return
+
+    (
+        jv_number,
+        current_type,
+        accounting_period,
+        current_remarks,
+        status,
+        prepared_by
+    ) = header
+
+    if status != "DRAFT" or prepared_by != employee_no:
+        return
+
+    st.divider()
+    st.subheader("Continue Draft")
+
+    if not is_period_open(accounting_period):
+        st.error(
+            f"{month_label(accounting_period)} is CLOSED. "
+            "This Draft is locked."
+        )
+        return
+
+    type_options = get_jv_type_options(
+        include_inactive=True
+    )
+
+    current_label = current_type
+
+    if not jv_type_is_active(current_type):
+        current_label = f"{current_type} [INACTIVE]"
+
+    if current_label not in type_options:
+        type_options.insert(0, current_label)
+
+    selected_type_display = st.selectbox(
+        "JV Type",
+        type_options,
+        index=type_options.index(current_label),
+        key=f"draft_type_{jv_id}"
+    )
+
+    selected_type = clean_jv_type_label(
+        selected_type_display
+    )
+
+    type_rule = get_jv_type_rule(
+        selected_type
+    )
+
+    draft_remarks = st.text_input(
+        "JV Description / Remarks",
+        value=current_remarks or "",
+        key=f"draft_remarks_{jv_id}"
+    )
+
+    edit_df = get_jv_lines_for_edit(jv_id)
+
+    if edit_df.empty:
+        edit_df = pd.DataFrame([
+            {
+                "Date": None,
+                "A/C Code": None,
+                "Description": "",
+                "Dr": 0.00,
+                "Cr": 0.00
+            },
+            {
+                "Date": None,
+                "A/C Code": None,
+                "Description": "",
+                "Dr": 0.00,
+                "Cr": 0.00
+            }
+        ])
+
+    draft_df = st.data_editor(
+        edit_df,
+        num_rows="dynamic",
+        hide_index=True,
+        use_container_width=True,
+        column_config={
+            "Date": st.column_config.DateColumn(
+                "Date",
+                format="DD/MM/YYYY"
+            ),
+            "A/C Code": st.column_config.SelectboxColumn(
+                "A/C Code",
+                options=get_gl_options(include_inactive=True)
+            ),
+            "Description": st.column_config.TextColumn(
+                "Description",
+                width="large"
+            ),
+            "Dr": st.column_config.NumberColumn(
+                "Dr",
+                min_value=0.00,
+                format="%.2f"
+            ),
+            "Cr": st.column_config.NumberColumn(
+                "Cr",
+                min_value=0.00,
+                format="%.2f"
+            )
+        },
+        key=f"draft_editor_{jv_id}"
+    )
+
+    draft_files = st.file_uploader(
+        "Add Supporting Documents",
+        type=[
+            "pdf",
+            "xlsx",
+            "xls",
+            "docx",
+            "jpg",
+            "jpeg",
+            "png"
+        ],
+        accept_multiple_files=True,
+        key=f"draft_files_{jv_id}"
+    )
+
+    debit_series = pd.to_numeric(
+        draft_df["Dr"],
+        errors="coerce"
+    ).fillna(0)
+
+    credit_series = pd.to_numeric(
+        draft_df["Cr"],
+        errors="coerce"
+    ).fillna(0)
+
+    total_debit = round(
+        float(debit_series.sum()),
+        2
+    )
+
+    total_credit = round(
+        float(credit_series.sum()),
+        2
+    )
+
+    submit_errors, _, _ = validate_journal(
+        draft_df
+    )
+
+    submit_errors.extend(
+        validate_journal_dates_against_period(
+            draft_df,
+            accounting_period
+        )
+    )
+
+    if not jv_type_is_active(selected_type):
+        submit_errors.append(
+            "Selected JV Type is inactive or invalid."
+        )
+
+    if (
+        type_rule
+        and type_rule["attachment_rule"] == "REQUIRED"
+        and not get_active_attachments(jv_id)
+        and not draft_files
+    ):
+        submit_errors.append(
+            f"Supporting document is required for JV Type: {selected_type}."
+        )
+
+    c1, c2, c3 = st.columns(3)
+
+    c1.metric(
+        "Total Dr",
+        f"RM {total_debit:,.2f}"
+    )
+
+    c2.metric(
+        "Total Cr",
+        f"RM {total_credit:,.2f}"
+    )
+
+    c3.metric(
+        "Difference",
+        f"RM {total_debit-total_credit:,.2f}"
+    )
+
+    if submit_errors:
+        with st.expander(
+            "Submission validation"
+        ):
+            for error in submit_errors:
+                st.write(f"• {error}")
+    else:
+        st.success(
+            "Ready for submission ✓"
+        )
+
+    c1, c2, c3 = st.columns(3)
+
+    with c1:
+        if st.button(
+            "Save Draft Changes",
+            use_container_width=True,
+            key=f"save_draft_changes_{jv_id}"
+        ):
+            update_existing_draft(
+                jv_id,
+                selected_type,
+                draft_remarks,
+                draft_df,
+                total_debit,
+                total_credit,
+                draft_files,
+                employee_no,
+                employee_name
+            )
+
+            st.success(
+                f"{jv_number} draft updated."
+            )
+            st.rerun()
+
+    with c2:
+        if st.button(
+            "Submit for Approval",
+            type="primary",
+            use_container_width=True,
+            disabled=bool(submit_errors),
+            key=f"submit_draft_{jv_id}"
+        ):
+            submit_existing_draft(
+                jv_id,
+                selected_type,
+                draft_remarks,
+                draft_df,
+                total_debit,
+                total_credit,
+                draft_files,
+                employee_no,
+                employee_name
+            )
+
+            st.session_state.myjv_jv_id = None
+            st.session_state.dashboard_jv_id = None
+
+            st.success(
+                f"{jv_number} submitted for approval."
+            )
+            st.rerun()
+
+    with c3:
+        confirm_cancel = st.checkbox(
+            "Confirm cancel",
+            key=f"confirm_cancel_draft_{jv_id}"
+        )
+
+        if st.button(
+            "Cancel JV",
+            use_container_width=True,
+            disabled=not confirm_cancel,
+            key=f"cancel_draft_{jv_id}"
+        ):
+            cancel_draft(
+                jv_id,
+                employee_no,
+                employee_name
+            )
+
+            st.session_state.myjv_jv_id = None
+            st.session_state.dashboard_jv_id = None
+
+            st.success(
+                f"{jv_number} cancelled."
+            )
+            st.rerun()
+
+
 def update_and_resubmit_jv(
     jv_id,
     jv_type,
@@ -2220,6 +2995,13 @@ def render_amendment_controls(jv_id, employee_no, employee_name):
     )
 
     errors, total_debit, total_credit = validate_journal(amended_df)
+
+    errors.extend(
+        validate_journal_dates_against_period(
+            amended_df,
+            accounting_period
+        )
+    )
 
     if not jv_type_is_active(amended_type):
         errors.append(
@@ -3273,13 +4055,18 @@ if st.session_state.page == "Dashboard":
             )
 
             if role == "PREPARER":
+                render_draft_controls(
+                    st.session_state.dashboard_jv_id,
+                    employee_no,
+                    user_name
+                )
+
                 render_post_to_ubs_control(
                     st.session_state.dashboard_jv_id,
                     employee_no,
                     user_name
                 )
 
-            if role == "PREPARER":
                 render_amendment_controls(
                     st.session_state.dashboard_jv_id,
                     employee_no,
@@ -3975,6 +4762,13 @@ elif st.session_state.page == "Create New JV":
             f"Cr RM{total_credit:,.2f}."
         )
 
+    errors.extend(
+        validate_journal_dates_against_period(
+            journal_df,
+            accounting_period
+        )
+    )
+
     if not jv_type_is_active(jv_type):
         errors.append(
             "Selected JV Type is inactive or invalid."
@@ -4020,33 +4814,68 @@ elif st.session_state.page == "Create New JV":
 
         submit_disabled = False
 
-    if st.button(
-        "Submit for Approval",
-        type="primary",
-        disabled=submit_disabled,
-        use_container_width=True
-    ):
+    c1, c2 = st.columns(2)
 
-        save_jv(
-            jv_number,
-            jv_type,
-            accounting_period,
-            remarks,
-            journal_df,
-            total_debit,
-            total_credit,
-            uploaded_files,
-            employee_no,
-            user_name
-        )
+    with c1:
 
-        st.success(
-            f"{jv_number} submitted successfully."
-        )
+        if st.button(
+            "Save Draft",
+            use_container_width=True,
+            disabled=selected_period_status == "CLOSED"
+        ):
 
-        st.info(
-            "Available in Approver's Approval Inbox."
-        )
+            draft_id = save_new_draft(
+                jv_number,
+                jv_type,
+                accounting_period,
+                remarks,
+                journal_df,
+                total_debit,
+                total_credit,
+                uploaded_files,
+                employee_no,
+                user_name
+            )
+
+            st.success(
+                f"{jv_number} saved as Draft."
+            )
+
+            st.info(
+                "Open My JVs to continue or submit this Draft."
+            )
+
+            st.rerun()
+
+    with c2:
+
+        if st.button(
+            "Submit for Approval",
+            type="primary",
+            disabled=submit_disabled,
+            use_container_width=True
+        ):
+
+            save_jv(
+                jv_number,
+                jv_type,
+                accounting_period,
+                remarks,
+                journal_df,
+                total_debit,
+                total_credit,
+                uploaded_files,
+                employee_no,
+                user_name
+            )
+
+            st.success(
+                f"{jv_number} submitted successfully."
+            )
+
+            st.info(
+                "Available in Approver's Approval Inbox."
+            )
 
 
 # =========================================================
@@ -4080,6 +4909,12 @@ elif st.session_state.page == "My JVs":
 
         show_jv_detail(
             st.session_state.myjv_jv_id
+        )
+
+        render_draft_controls(
+            st.session_state.myjv_jv_id,
+            employee_no,
+            user_name
         )
 
         render_amendment_controls(
