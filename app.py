@@ -2341,10 +2341,6 @@ def render_draft_controls(jv_id, employee_no, employee_name):
         st.error(f"{month_label(accounting_period)} is CLOSED. This JV is locked.")
         return
 
-    if month_has_been_submitted(accounting_period, employee_no):
-        st.error("This month has already been submitted for approval.")
-        return
-
     type_options = get_jv_type_options(include_inactive=True)
     current_label = current_type if jv_type_is_active(current_type) else f"{current_type} [INACTIVE]"
     if current_label not in type_options:
@@ -2515,25 +2511,18 @@ def get_month_submission_summary(accounting_period, employee_no):
     if total == 0:
         return counts, "NO JV"
 
-    already_submitted = month_has_been_submitted(
-        period,
-        employee_no
-    )
+    # Any new working JV means the month is active again, even when
+    # an earlier batch has already been submitted.
+    if counts.get("DRAFT", 0) > 0:
+        return counts, "IN PROGRESS"
 
-    if not already_submitted:
-        if counts.get("DRAFT", 0) > 0:
-            month_status = "IN PROGRESS"
-        elif counts.get("READY", 0) > 0:
-            month_status = "READY FOR SUBMISSION"
-        else:
-            month_status = "IN PROGRESS"
-
-        return counts, month_status
+    if counts.get("READY", 0) > 0:
+        return counts, "READY FOR SUBMISSION"
 
     if counts.get("AMENDMENT REQUIRED", 0) > 0:
-        month_status = "AMENDMENT REQUIRED"
+        return counts, "AMENDMENT REQUIRED"
 
-    elif (
+    if (
         counts.get("PENDING APPROVAL", 0) > 0
         or counts.get("RESUBMITTED", 0) > 0
     ):
@@ -2543,22 +2532,19 @@ def get_month_submission_summary(accounting_period, employee_no):
         )
 
         if approved_total > 0:
-            month_status = "PARTIALLY APPROVED"
-        else:
-            month_status = "PENDING APPROVAL"
+            return counts, "PARTIALLY APPROVED"
 
-    else:
-        final_total = (
-            counts.get("APPROVED", 0)
-            + counts.get("POSTED TO UBS", 0)
-        )
+        return counts, "PENDING APPROVAL"
 
-        if final_total == total:
-            month_status = "COMPLETED"
-        else:
-            month_status = "SUBMITTED"
+    final_total = (
+        counts.get("APPROVED", 0)
+        + counts.get("POSTED TO UBS", 0)
+    )
 
-    return counts, month_status
+    if final_total == total:
+        return counts, "COMPLETED"
+
+    return counts, "IN PROGRESS"
 
 
 def save_new_working_jv(
@@ -2581,11 +2567,8 @@ def save_new_working_jv(
             f"{month_label(period)} is CLOSED."
         )
 
-    if month_has_been_submitted(period, employee_no):
-        raise PermissionError(
-            f"{month_label(period)} has already been submitted for approval."
-        )
-
+    # A period may receive an additional JV while it remains OPEN.
+    # Any newly saved READY JV will be picked up in a later supplemental batch.
     status = "READY" if ready_for_month else "DRAFT"
 
     attachment_names = [
@@ -2714,11 +2697,8 @@ def update_working_jv(
             f"{month_label(accounting_period)} is CLOSED."
         )
 
-    if month_has_been_submitted(accounting_period, employee_no):
-        raise PermissionError(
-            "This month has already been submitted for approval."
-        )
-
+    # Earlier JVs in this month may already have been submitted.
+    # This working JV remains editable until its own batch is submitted.
     new_status = "READY" if ready_for_month else "DRAFT"
 
     try:
@@ -2796,14 +2776,9 @@ def submit_monthly_batch(
             f"{month_label(period)} is CLOSED."
         )
 
-    if month_has_been_submitted(period, employee_no):
-        raise PermissionError(
-            "This month has already been submitted for approval."
-        )
-
     conn = get_connection()
 
-    rows = conn.execute("""
+    working_rows = conn.execute("""
         SELECT
             id,
             jv_number,
@@ -2811,36 +2786,48 @@ def submit_monthly_batch(
         FROM jv_headers
         WHERE accounting_period = ?
         AND prepared_by = ?
-        AND status != 'CANCELLED'
+        AND status IN ('DRAFT', 'READY')
         ORDER BY id
     """, (
         period,
         employee_no
     )).fetchall()
 
-    if not rows:
+    if not working_rows:
         conn.close()
         raise ValueError(
-            "No JV records found for this accounting month."
+            "There are no Draft or Ready JVs waiting for submission."
         )
 
-    invalid = [
+    draft_rows = [
         (jv_number, status)
-        for _, jv_number, status in rows
-        if status != "READY"
+        for _, jv_number, status in working_rows
+        if status == "DRAFT"
     ]
 
-    if invalid:
+    if draft_rows:
         conn.close()
 
         summary = ", ".join(
-            f"{jv_number} ({status})"
-            for jv_number, status in invalid[:5]
+            jv_number
+            for jv_number, _ in draft_rows[:5]
         )
 
         raise PermissionError(
-            "Monthly submission is allowed only when every active JV is READY. "
-            f"Please check: {summary}"
+            "Monthly submission is blocked because some JVs are still DRAFT. "
+            f"Please complete: {summary}"
+        )
+
+    ready_rows = [
+        row
+        for row in working_rows
+        if row[2] == "READY"
+    ]
+
+    if not ready_rows:
+        conn.close()
+        raise ValueError(
+            "There are no READY JVs waiting for submission."
         )
 
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -2859,30 +2846,38 @@ def submit_monthly_batch(
         period,
         employee_no,
         employee_name,
-        len(rows),
+        len(ready_rows),
         now
     ))
 
     batch_id = cursor.lastrowid
 
-    cursor.execute("""
+    ready_ids = [
+        row[0]
+        for row in ready_rows
+    ]
+
+    placeholders = ",".join(
+        "?"
+        for _ in ready_ids
+    )
+
+    cursor.execute(
+        f"""
         UPDATE jv_headers
         SET
             status = 'PENDING APPROVAL',
             submitted_at = ?
-        WHERE accounting_period = ?
-        AND prepared_by = ?
+        WHERE id IN ({placeholders})
         AND status = 'READY'
-    """, (
-        now,
-        period,
-        employee_no
-    ))
+        """,
+        [now] + ready_ids
+    )
 
     conn.commit()
     conn.close()
 
-    for jv_id, jv_number, _ in rows:
+    for jv_id, jv_number, _ in ready_rows:
         add_audit_log(
             jv_id,
             jv_number,
@@ -2896,14 +2891,14 @@ def submit_monthly_batch(
     notify_active_role(
         "APPROVER",
         f"Monthly JV submission: {month_label(period)}",
-        f"{employee_name} submitted {len(rows)} JV(s) for {month_label(period)}.",
+        f"{employee_name} submitted {len(ready_rows)} JV(s) for {month_label(period)}.",
         "MONTHLY_JV_SUBMITTED",
         None,
         None,
         exclude_employee_no=employee_no
     )
 
-    return batch_id, len(rows)
+    return batch_id, len(ready_rows)
 
 
 def update_and_resubmit_jv(
@@ -3799,7 +3794,15 @@ defaults = {
     "last_saved_jv_number": None,
     "last_saved_jv_status": None,
     "last_saved_jv_id": None,
-    "show_saved_jv_confirmation": False
+    "show_saved_jv_confirmation": False,
+
+    # Monthly workspace JV viewer
+    "workspace_jv_id": None,
+    "workspace_month": None,
+
+    # Safe programmatic sidebar navigation
+    "requested_page": None,
+    "nav_version": 0
 }
 
 for key, value in defaults.items():
@@ -3855,11 +3858,36 @@ def reset_drilldowns():
         "search_jv_id",
         "audit_month",
         "amend_jv_id",
-        "monthly_month"
+        "monthly_month",
+        "workspace_jv_id",
+        "workspace_month"
     ]
 
     for key in keys:
         st.session_state[key] = None
+
+
+def request_navigation(page_name):
+    """Navigate on the next rerun without mutating an already-rendered radio widget."""
+    st.session_state.requested_page = page_name
+    st.rerun()
+
+
+def get_month_workspace_jvs(accounting_period, employee_no):
+    conn = get_connection()
+    rows = conn.execute("""
+        SELECT id, jv_number, status
+        FROM jv_headers
+        WHERE accounting_period = ?
+        AND prepared_by = ?
+        AND status != 'CANCELLED'
+        ORDER BY id
+    """, (
+        period_key(accounting_period),
+        employee_no
+    )).fetchall()
+    conn.close()
+    return rows
 
 
 def logout():
@@ -3998,6 +4026,12 @@ with st.sidebar:
             "Dashboard"
         ]
 
+    # Apply any page change requested by a button on the previous run.
+    if st.session_state.requested_page in menu_options:
+        st.session_state.page = st.session_state.requested_page
+        st.session_state.requested_page = None
+        st.session_state.nav_version += 1
+
     if role in ["PREPARER", "APPROVER"]:
         unread_count = unread_notification_count(employee_no)
 
@@ -4007,13 +4041,20 @@ with st.sidebar:
                 f"{'s' if unread_count != 1 else ''}"
             )
 
+    current_index = (
+        menu_options.index(st.session_state.page)
+        if st.session_state.page in menu_options
+        else 0
+    )
+
     selected_page = st.radio(
         "Navigation",
-        menu_options
+        menu_options,
+        index=current_index,
+        key=f"navigation_radio_{st.session_state.nav_version}"
     )
 
     if selected_page != st.session_state.page:
-
         st.session_state.page = selected_page
         reset_drilldowns()
 
@@ -4779,6 +4820,168 @@ elif st.session_state.page == "Create / Save JV":
 
         st.stop()
 
+    # -----------------------------------------------------
+    # EXISTING JV OPENED FROM MONTHLY WORKSPACE
+    # -----------------------------------------------------
+
+    if st.session_state.workspace_jv_id:
+
+        current_jv_id = st.session_state.workspace_jv_id
+
+        conn = get_connection()
+        current_header = conn.execute("""
+            SELECT
+                jv_number,
+                accounting_period,
+                status,
+                prepared_by
+            FROM jv_headers
+            WHERE id = ?
+        """, (
+            current_jv_id,
+        )).fetchone()
+        conn.close()
+
+        if not current_header:
+            st.error("JV not found.")
+            st.session_state.workspace_jv_id = None
+            st.stop()
+
+        current_jv_number, current_period, current_status, current_preparer = current_header
+
+        if current_preparer != employee_no:
+            st.error("Access denied.")
+            st.stop()
+
+        st.session_state.workspace_month = current_period
+
+        month_jvs = get_month_workspace_jvs(
+            current_period,
+            employee_no
+        )
+
+        month_ids = [
+            row[0]
+            for row in month_jvs
+        ]
+
+        current_index = (
+            month_ids.index(current_jv_id)
+            if current_jv_id in month_ids
+            else 0
+        )
+
+        st.header(
+            f"Create / Save JV — {month_label(current_period)}"
+        )
+
+        st.caption(
+            f"Viewing {current_jv_number} | Status: {current_status}"
+        )
+
+        nav1, nav2, nav3, nav4 = st.columns(
+            [1, 1, 1.4, 1.4]
+        )
+
+        with nav1:
+            if st.button(
+                "← Previous JV",
+                use_container_width=True,
+                disabled=current_index <= 0,
+                key=f"workspace_prev_{current_jv_id}"
+            ):
+                st.session_state.workspace_jv_id = month_ids[current_index - 1]
+                st.rerun()
+
+        with nav2:
+            if st.button(
+                "Next JV →",
+                use_container_width=True,
+                disabled=current_index >= len(month_ids) - 1,
+                key=f"workspace_next_{current_jv_id}"
+            ):
+                st.session_state.workspace_jv_id = month_ids[current_index + 1]
+                st.rerun()
+
+        with nav3:
+            if is_period_open(current_period):
+                if st.button(
+                    "＋ Create New JV",
+                    type="primary",
+                    use_container_width=True,
+                    key=f"workspace_create_new_{current_period}"
+                ):
+                    st.session_state.workspace_jv_id = None
+                    st.session_state.show_saved_jv_confirmation = False
+
+                    year_value, month_value = [
+                        int(part)
+                        for part in current_period.split("-")
+                    ]
+
+                    st.session_state.create_accounting_month = date(
+                        year_value,
+                        month_value,
+                        1
+                    )
+
+                    for widget_key in [
+                        "journal_editor",
+                        "create_remarks",
+                        "create_supporting_docs",
+                        "create_jv_type"
+                    ]:
+                        if widget_key in st.session_state:
+                            del st.session_state[widget_key]
+
+                    st.rerun()
+            else:
+                st.caption("Period Closed")
+
+        with nav4:
+            if st.button(
+                "Back to Monthly Workspace",
+                use_container_width=True,
+                key=f"workspace_back_{current_period}"
+            ):
+                st.session_state.monthly_month = current_period
+                st.session_state.workspace_jv_id = None
+                request_navigation("Monthly Workspace")
+
+        st.divider()
+
+        # Working JVs are editable. Submitted/final JVs are read-only here.
+        if current_status in ("DRAFT", "READY"):
+            render_draft_controls(
+                current_jv_id,
+                employee_no,
+                user_name
+            )
+
+        elif current_status == "AMENDMENT REQUIRED":
+            show_jv_detail(
+                current_jv_id
+            )
+
+            render_amendment_controls(
+                current_jv_id,
+                employee_no,
+                user_name
+            )
+
+        else:
+            show_jv_detail(
+                current_jv_id
+            )
+
+            render_post_to_ubs_control(
+                current_jv_id,
+                employee_no,
+                user_name
+            )
+
+        st.stop()
+
     st.header("Create / Save JV")
     st.caption(
         "Prepare an individual JV and save it to the monthly workspace. "
@@ -4836,8 +5039,7 @@ elif st.session_state.page == "Create / Save JV":
                 key="go_monthly_workspace_after_save"
             ):
                 st.session_state.show_saved_jv_confirmation = False
-                st.session_state.page = "Monthly Workspace"
-                st.rerun()
+                request_navigation("Monthly Workspace")
 
         st.divider()
 
@@ -4867,11 +5069,6 @@ elif st.session_state.page == "Create / Save JV":
 
     selected_period_status = get_period_status(
         accounting_period
-    )
-
-    month_locked_for_new_jv = month_has_been_submitted(
-        accounting_period,
-        employee_no
     )
 
     with col2:
@@ -4922,11 +5119,6 @@ elif st.session_state.page == "Create / Save JV":
         st.error(
             f"{month_label(accounting_period.strftime('%Y-%m'))} is CLOSED. "
             "New JVs cannot be saved for this accounting month."
-        )
-    elif month_locked_for_new_jv:
-        st.error(
-            f"{month_label(accounting_period.strftime('%Y-%m'))} has already been submitted for approval. "
-            "New JVs are locked for this month."
         )
     else:
         st.caption(
@@ -5204,7 +5396,7 @@ elif st.session_state.page == "Create / Save JV":
         "Save JV",
         type="primary",
         use_container_width=True,
-        disabled=(selected_period_status == "CLOSED" or month_locked_for_new_jv)
+        disabled=(selected_period_status == "CLOSED")
     ):
         saved_id, saved_status = save_new_working_jv(
             jv_number,
@@ -5259,7 +5451,47 @@ elif st.session_state.page == "Monthly Workspace":
             st.session_state.monthly_month = None
             st.rerun()
 
-        st.subheader(month_label(selected_month))
+        title_col, create_col = st.columns([4, 1])
+
+        with title_col:
+            st.subheader(month_label(selected_month))
+
+        with create_col:
+            if is_period_open(selected_month):
+                if st.button(
+                    "＋ Create New JV",
+                    type="primary",
+                    use_container_width=True,
+                    key=f"monthly_create_new_{selected_month}"
+                ):
+                    st.session_state.workspace_jv_id = None
+                    st.session_state.workspace_month = selected_month
+                    st.session_state.show_saved_jv_confirmation = False
+
+                    year_value, month_value = [
+                        int(part)
+                        for part in selected_month.split("-")
+                    ]
+
+                    st.session_state.create_accounting_month = date(
+                        year_value,
+                        month_value,
+                        1
+                    )
+
+                    for widget_key in [
+                        "journal_editor",
+                        "create_remarks",
+                        "create_supporting_docs",
+                        "create_jv_type"
+                    ]:
+                        if widget_key in st.session_state:
+                            del st.session_state[widget_key]
+
+                    request_navigation("Create / Save JV")
+            else:
+                st.caption("Period Closed")
+
         counts, month_status = get_month_submission_summary(selected_month, employee_no)
 
         c1,c2,c3,c4 = st.columns(4)
@@ -5292,27 +5524,44 @@ elif st.session_state.page == "Monthly Workspace":
                 c2.write(jv_type)
                 c3.write(f"RM {amount:,.2f}  \n{status}")
                 with c4:
-                    if status in ("DRAFT","READY"):
-                        if st.button("Open", key=f"monthly_open_{jv_id}", use_container_width=True):
-                            st.session_state.myjv_jv_id = jv_id
-                            st.session_state.page = "My JVs"
-                            st.rerun()
-                    else:
-                        st.caption("Submitted")
+                    if st.button(
+                        "Open",
+                        key=f"monthly_open_{jv_id}",
+                        use_container_width=True
+                    ):
+                        st.session_state.workspace_jv_id = jv_id
+                        st.session_state.workspace_month = selected_month
+                        st.session_state.show_saved_jv_confirmation = False
+                        request_navigation("Create / Save JV")
                 st.divider()
 
         draft_count = counts.get("DRAFT",0)
         ready_count = counts.get("READY",0)
-        already_submitted = month_has_been_submitted(selected_month, employee_no)
 
-        if already_submitted:
-            st.success("This month has already been submitted to the Approver.")
-        elif draft_count > 0:
-            st.warning(f"Monthly submission is blocked. {draft_count} JV(s) are still DRAFT.")
+        if draft_count > 0:
+            st.warning(
+                f"Monthly submission is blocked. {draft_count} JV(s) are still DRAFT."
+            )
         elif ready_count == 0:
-            st.warning("There are no READY JVs to submit for this month.")
+            submitted_or_final = (
+                counts.get("PENDING APPROVAL",0)
+                + counts.get("RESUBMITTED",0)
+                + counts.get("AMENDMENT REQUIRED",0)
+                + counts.get("APPROVED",0)
+                + counts.get("POSTED TO UBS",0)
+            )
+
+            if submitted_or_final > 0:
+                st.info(
+                    "No new READY JVs are waiting for submission. "
+                    "You can still create another JV while the accounting period remains OPEN."
+                )
+            else:
+                st.warning("There are no READY JVs to submit for this month.")
         else:
-            st.success(f"All {ready_count} active JV(s) are READY for monthly submission.")
+            st.success(
+                f"{ready_count} JV(s) are READY for the next monthly submission batch."
+            )
             confirm_month = st.checkbox(
                 f"I confirm the JV set for {month_label(selected_month)} is complete and ready for approval.",
                 key=f"confirm_month_{selected_month}"
