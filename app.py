@@ -448,8 +448,8 @@ def create_user_account(employee_no, employee_name, role, temporary_password, cr
         raise ValueError("Employee Number is required.")
     if not employee_name.strip():
         raise ValueError("Employee Name is required.")
-    if len(temporary_password) < 8:
-        raise ValueError("Temporary password must contain at least 8 characters.")
+    if temporary_password is None or str(temporary_password) == "":
+        raise ValueError("Temporary password is required.")
 
     conn = get_connection()
     exists = conn.execute(
@@ -657,32 +657,29 @@ def format_file_size(file_size):
 
 
 def render_attachments(jv_id, status, legacy_attachment_names=None):
-    """Render only the current active supporting documents."""
+    """Render current supporting documents with view-first behaviour."""
+    import base64
+
     attachments = get_active_attachments(jv_id)
 
-    # Auditor/Guest should only receive final/latest supporting documents.
-    if role == "AUDITOR" and status not in ("APPROVED", "POSTED TO UBS"):
+    if role == 'AUDITOR' and status not in ('APPROVED', 'POSTED TO UBS'):
         return
 
     st.divider()
-    st.subheader("Supporting Documents")
+    st.subheader('Supporting Documents')
 
     if not attachments:
-        # Existing prototype JVs may pre-date real attachment storage.
         try:
-            legacy_names = json.loads(legacy_attachment_names or "[]")
+            legacy_names = json.loads(legacy_attachment_names or '[]')
         except:
             legacy_names = []
 
         if legacy_names:
-            st.warning(
-                "These files were uploaded before document storage was enabled. "
-                "Only the filenames were retained in the earlier prototype."
-            )
+            st.caption('Legacy attachment filenames:')
             for name in legacy_names:
-                st.write(f"• {name}")
+                st.write(f'• {name}')
         else:
-            st.caption("No supporting documents attached.")
+            st.caption('No supporting documents attached.')
         return
 
     for attachment in attachments:
@@ -699,37 +696,55 @@ def render_attachments(jv_id, status, legacy_attachment_names=None):
             uploaded_at
         ) = attachment
 
-        c1, c2 = st.columns([4, 1])
+        path = Path(stored_path)
 
-        with c1:
-            st.write(f"**{original_filename}**")
+        if not path.exists():
+            st.error(f'{original_filename}: file unavailable')
+            continue
+
+        file_bytes = path.read_bytes()
+        mime = mime_type or 'application/octet-stream'
+
+        st.write(f'**{original_filename}**')
+        st.caption(
+            f'{format_file_size(file_size)} | '
+            f'Uploaded by {uploaded_name} ({uploaded_by}) | '
+            f'{display_datetime(uploaded_at)}'
+        )
+
+        # View is the default experience for formats that browsers can preview.
+        lower_name = original_filename.lower()
+
+        if mime.startswith('image/') or lower_name.endswith(('.png', '.jpg', '.jpeg')):
+            st.image(file_bytes, caption=original_filename, use_container_width=True)
+
+        elif mime == 'application/pdf' or lower_name.endswith('.pdf'):
+            encoded = base64.b64encode(file_bytes).decode('utf-8')
+            iframe_html = (
+                f'<iframe src="data:application/pdf;base64,{encoded}" '
+                'width="100%" height="650" style="border:1px solid #ddd; '
+                'border-radius:8px;"></iframe>'
+            )
+            st.markdown(iframe_html, unsafe_allow_html=True)
+
+        else:
+            st.caption('Preview is not available for this file type. Use Download to open it offline.')
+
+        st.download_button(
+            'Download',
+            data=file_bytes,
+            file_name=original_filename,
+            mime=mime,
+            key=f'download_attachment_{attachment_id}',
+            use_container_width=False
+        )
+
+        if role != 'AUDITOR':
             st.caption(
-                f"{format_file_size(file_size)} | "
-                f"Uploaded by {uploaded_name} ({uploaded_by}) | "
-                f"{display_datetime(uploaded_at)}"
+                f'Revision {revision_no} | SHA-256: {sha256_hash[:16]}...'
             )
 
-            # Hide revision detail from Auditor to keep Guest view simple.
-            if role != "AUDITOR":
-                st.caption(
-                    f"Revision {revision_no} | "
-                    f"SHA-256: {sha256_hash[:16]}..."
-                )
-
-        with c2:
-            path = Path(stored_path)
-
-            if path.exists():
-                st.download_button(
-                    "Open / Download",
-                    data=path.read_bytes(),
-                    file_name=original_filename,
-                    mime=mime_type or "application/octet-stream",
-                    key=f"download_attachment_{attachment_id}",
-                    use_container_width=True
-                )
-            else:
-                st.error("File unavailable")
+        st.divider()
 
 
 def add_notification(
@@ -913,6 +928,9 @@ def seed_gl_master():
     conn.close()
 
 
+DEFAULT_JV_TYPE = "General"
+
+
 def get_gl_options(include_inactive=False):
     conn = get_connection()
 
@@ -945,6 +963,152 @@ def get_gl_options(include_inactive=False):
         options.append(label)
 
     return options
+
+
+def get_gl_code_options(include_inactive=False):
+    """Return G/L codes only for journal-entry dropdowns."""
+    conn = get_connection()
+
+    if include_inactive:
+        rows = conn.execute("""
+            SELECT gl_code, status
+            FROM gl_master
+            WHERE entity = 'JKPSD'
+            ORDER BY gl_code
+        """).fetchall()
+    else:
+        rows = conn.execute("""
+            SELECT gl_code, status
+            FROM gl_master
+            WHERE entity = 'JKPSD'
+            AND status = 'ACTIVE'
+            ORDER BY gl_code
+        """).fetchall()
+
+    conn.close()
+
+    options = []
+    for gl_code, status in rows:
+        label = gl_code
+        if include_inactive and status != 'ACTIVE':
+            label += ' [INACTIVE]'
+        options.append(label)
+    return options
+
+
+def get_gl_description_map():
+    conn = get_connection()
+    rows = conn.execute("""
+        SELECT gl_code, gl_description
+        FROM gl_master
+        WHERE entity = 'JKPSD'
+    """).fetchall()
+    conn.close()
+    return {
+        str(code): (description or '')
+        for code, description in rows
+    }
+
+
+def auto_fill_gl_descriptions(df):
+    """Make journal Description follow the selected G/L master description."""
+    result = df.copy()
+    gl_map = get_gl_description_map()
+
+    if 'Description' not in result.columns:
+        result['Description'] = ''
+
+    for idx, row in result.iterrows():
+        selected = row.get('A/C Code')
+        code = parse_gl_code(selected)
+        result.at[idx, 'Description'] = gl_map.get(code, '') if code else ''
+
+    return result
+
+
+def render_auto_gl_editor(base_df, key_prefix, include_inactive=False):
+    """Data editor with G/L code only and read-only auto-filled account description."""
+    data_key = f'{key_prefix}_data'
+    version_key = f'{key_prefix}_version'
+
+    if data_key not in st.session_state:
+        st.session_state[data_key] = auto_fill_gl_descriptions(base_df.copy())
+
+    if version_key not in st.session_state:
+        st.session_state[version_key] = 0
+
+    editor_key = f'{key_prefix}_{st.session_state[version_key]}'
+
+    edited = st.data_editor(
+        st.session_state[data_key],
+        num_rows='dynamic',
+        hide_index=True,
+        use_container_width=True,
+        column_config={
+            'Date': st.column_config.DateColumn(
+                'Date',
+                format='DD/MM/YYYY'
+            ),
+            'A/C Code': st.column_config.SelectboxColumn(
+                'A/C Code',
+                options=get_gl_code_options(include_inactive=include_inactive)
+            ),
+            'Description': st.column_config.TextColumn(
+                'Description',
+                width='large'
+            ),
+            'Dr': st.column_config.NumberColumn(
+                'Dr',
+                min_value=0.00,
+                format='%.2f'
+            ),
+            'Cr': st.column_config.NumberColumn(
+                'Cr',
+                min_value=0.00,
+                format='%.2f'
+            )
+        },
+        disabled=['Description'],
+        key=editor_key
+    )
+
+    enriched = auto_fill_gl_descriptions(edited)
+
+    previous_descriptions = edited['Description'].fillna('').astype(str).tolist()
+    new_descriptions = enriched['Description'].fillna('').astype(str).tolist()
+
+    st.session_state[data_key] = enriched
+
+    if previous_descriptions != new_descriptions:
+        st.session_state[version_key] += 1
+        st.rerun()
+
+    return enriched
+
+
+def clear_journal_editor_state(key_prefix):
+    for suffix in ('_data', '_version'):
+        key = f'{key_prefix}{suffix}'
+        if key in st.session_state:
+            del st.session_state[key]
+
+
+def get_last_jv_remarks(accounting_period, employee_no):
+    conn = get_connection()
+    row = conn.execute("""
+        SELECT remarks
+        FROM jv_headers
+        WHERE accounting_period = ?
+        AND prepared_by = ?
+        AND status != 'CANCELLED'
+        ORDER BY id DESC
+        LIMIT 1
+    """, (
+        period_key(accounting_period),
+        employee_no
+    )).fetchone()
+    conn.close()
+    return (row[0] or '') if row else ''
 
 
 def parse_gl_code(selected_value):
@@ -1643,8 +1807,6 @@ def get_jv_lines_for_edit(jv_id):
         SELECT
             line_date,
             gl_code,
-            gl_description,
-            description,
             debit,
             credit
         FROM jv_lines
@@ -1654,36 +1816,25 @@ def get_jv_lines_for_edit(jv_id):
 
     conn.close()
 
+    gl_map = get_gl_description_map()
     data = []
 
-    for (
-        line_date,
-        gl_code,
-        gl_description,
-        description,
-        debit,
-        credit
-    ) in rows:
+    for line_date, gl_code, debit, credit in rows:
 
         try:
             edit_date = datetime.strptime(
                 str(line_date)[:10],
-                "%Y-%m-%d"
+                '%Y-%m-%d'
             ).date()
         except:
             edit_date = None
 
-        gl_value = gl_code
-
-        if gl_description:
-            gl_value = f"{gl_code} - {gl_description}"
-
         data.append({
-            "Date": edit_date,
-            "A/C Code": gl_value,
-            "Description": description,
-            "Dr": float(debit or 0),
-            "Cr": float(credit or 0)
+            'Date': edit_date,
+            'A/C Code': gl_code,
+            'Description': gl_map.get(str(gl_code), ''),
+            'Dr': float(debit or 0),
+            'Cr': float(credit or 0)
         })
 
     return pd.DataFrame(data)
@@ -1889,9 +2040,9 @@ def validate_journal_dates_against_period(journal_df, accounting_period):
 
 
 def write_jv_lines(cursor, jv_id, journal_df):
-    """Replace JV lines while allowing incomplete rows for Draft status."""
+    """Replace JV lines; account description is controlled by G/L Master."""
     cursor.execute(
-        "DELETE FROM jv_lines WHERE jv_id = ?",
+        'DELETE FROM jv_lines WHERE jv_id = ?',
         (jv_id,)
     )
 
@@ -1900,30 +2051,22 @@ def write_jv_lines(cursor, jv_id, journal_df):
     if journal_df is None:
         return
 
+    gl_map = get_gl_description_map()
+
     for _, row in journal_df.iterrows():
 
         debit = float(
-            pd.to_numeric(
-                row.get("Dr"),
-                errors="coerce"
-            )
-            if pd.notna(row.get("Dr"))
-            else 0
+            pd.to_numeric(row.get('Dr'), errors='coerce')
+            if pd.notna(row.get('Dr')) else 0
         )
-
         credit = float(
-            pd.to_numeric(
-                row.get("Cr"),
-                errors="coerce"
-            )
-            if pd.notna(row.get("Cr"))
-            else 0
+            pd.to_numeric(row.get('Cr'), errors='coerce')
+            if pd.notna(row.get('Cr')) else 0
         )
 
         has_data = (
-            pd.notna(row.get("Date"))
-            or pd.notna(row.get("A/C Code"))
-            or str(row.get("Description", "")).strip() != ""
+            pd.notna(row.get('Date'))
+            or pd.notna(row.get('A/C Code'))
             or debit > 0
             or credit > 0
         )
@@ -1931,26 +2074,14 @@ def write_jv_lines(cursor, jv_id, journal_df):
         if not has_data:
             continue
 
-        selected_gl = row.get("A/C Code")
-        gl_code = ""
-        gl_description = ""
+        gl_code = parse_gl_code(row.get('A/C Code'))
+        gl_description = gl_map.get(gl_code, '')
 
-        if pd.notna(selected_gl):
-            selected_gl = str(selected_gl)
-            gl_code = parse_gl_code(selected_gl)
-
-            if " - " in selected_gl:
-                gl_description = selected_gl.split(
-                    " - ",
-                    1
-                )[1].replace(" [INACTIVE]", "").strip()
-
-        line_date = row.get("Date")
-
-        if hasattr(line_date, "strftime"):
-            line_date = line_date.strftime("%Y-%m-%d")
+        line_date = row.get('Date')
+        if hasattr(line_date, 'strftime'):
+            line_date = line_date.strftime('%Y-%m-%d')
         elif pd.isna(line_date):
-            line_date = ""
+            line_date = ''
         else:
             line_date = str(line_date)
 
@@ -1972,7 +2103,7 @@ def write_jv_lines(cursor, jv_id, journal_df):
             line_date,
             gl_code,
             gl_description,
-            str(row.get("Description", "") or ""),
+            gl_description,
             debit,
             credit
         ))
@@ -2316,7 +2447,7 @@ def cancel_draft(jv_id, employee_no, employee_name):
 
 
 def render_draft_controls(jv_id, employee_no, employee_name):
-    if role != "PREPARER":
+    if role != 'PREPARER':
         return
 
     conn = get_connection()
@@ -2331,125 +2462,91 @@ def render_draft_controls(jv_id, employee_no, employee_name):
 
     jv_number,current_type,accounting_period,current_remarks,status,prepared_by = header
 
-    if status not in ("DRAFT", "READY") or prepared_by != employee_no:
+    if status not in ('DRAFT', 'READY') or prepared_by != employee_no:
         return
 
     st.divider()
-    st.subheader("Edit Working JV")
+    st.subheader('Edit Working JV')
 
     if not is_period_open(accounting_period):
-        st.error(f"{month_label(accounting_period)} is CLOSED. This JV is locked.")
+        st.error(f'{month_label(accounting_period)} is CLOSED. This JV is locked.')
         return
 
-    type_options = get_jv_type_options(include_inactive=True)
-    current_label = current_type if jv_type_is_active(current_type) else f"{current_type} [INACTIVE]"
-    if current_label not in type_options:
-        type_options.insert(0, current_label)
-
-    selected_type_display = st.selectbox(
-        "JV Type", type_options,
-        index=type_options.index(current_label),
-        key=f"draft_type_{jv_id}"
-    )
-    selected_type = clean_jv_type_label(selected_type_display)
-    type_rule = get_jv_type_rule(selected_type)
-
     draft_remarks = st.text_input(
-        "JV Description / Remarks",
-        value=current_remarks or "",
-        key=f"draft_remarks_{jv_id}"
+        'JV Description / Remarks',
+        value=current_remarks or '',
+        key=f'draft_remarks_{jv_id}'
     )
 
     edit_df = get_jv_lines_for_edit(jv_id)
     if edit_df.empty:
         edit_df = pd.DataFrame([
-            {"Date":None,"A/C Code":None,"Description":"","Dr":0.0,"Cr":0.0},
-            {"Date":None,"A/C Code":None,"Description":"","Dr":0.0,"Cr":0.0}
+            {'Date':None,'A/C Code':None,'Description':'','Dr':0.0,'Cr':0.0},
+            {'Date':None,'A/C Code':None,'Description':'','Dr':0.0,'Cr':0.0}
         ])
 
-    draft_df = st.data_editor(
+    draft_df = render_auto_gl_editor(
         edit_df,
-        num_rows="dynamic",
-        hide_index=True,
-        use_container_width=True,
-        column_config={
-            "Date": st.column_config.DateColumn("Date", format="DD/MM/YYYY"),
-            "A/C Code": st.column_config.SelectboxColumn(
-                "A/C Code", options=get_gl_options(include_inactive=True)
-            ),
-            "Description": st.column_config.TextColumn("Description", width="large"),
-            "Dr": st.column_config.NumberColumn("Dr", min_value=0.00, format="%.2f"),
-            "Cr": st.column_config.NumberColumn("Cr", min_value=0.00, format="%.2f")
-        },
-        key=f"draft_editor_{jv_id}"
+        key_prefix=f'draft_editor_{jv_id}',
+        include_inactive=True
     )
 
     draft_files = st.file_uploader(
-        "Add Supporting Documents",
-        type=["pdf","xlsx","xls","docx","jpg","jpeg","png"],
+        'Add Supporting Documents (Optional)',
+        type=['pdf','xlsx','xls','docx','jpg','jpeg','png'],
         accept_multiple_files=True,
-        key=f"draft_files_{jv_id}"
+        key=f'draft_files_{jv_id}'
     )
 
-    debit_series = pd.to_numeric(draft_df["Dr"], errors="coerce").fillna(0)
-    credit_series = pd.to_numeric(draft_df["Cr"], errors="coerce").fillna(0)
+    debit_series = pd.to_numeric(draft_df['Dr'], errors='coerce').fillna(0)
+    credit_series = pd.to_numeric(draft_df['Cr'], errors='coerce').fillna(0)
     total_debit = round(float(debit_series.sum()),2)
     total_credit = round(float(credit_series.sum()),2)
 
     errors, _, _ = validate_journal(draft_df)
     errors.extend(validate_journal_dates_against_period(draft_df, accounting_period))
 
-    if not jv_type_is_active(selected_type):
-        errors.append("Selected JV Type is inactive or invalid.")
-
-    if (
-        type_rule
-        and type_rule["attachment_rule"] == "REQUIRED"
-        and not get_active_attachments(jv_id)
-        and not draft_files
-    ):
-        errors.append(f"Supporting document is required for JV Type: {selected_type}.")
-
     c1,c2,c3 = st.columns(3)
-    c1.metric("Total Dr", f"RM {total_debit:,.2f}")
-    c2.metric("Total Cr", f"RM {total_credit:,.2f}")
-    c3.metric("Difference", f"RM {total_debit-total_credit:,.2f}")
+    c1.metric('Total Dr', f'RM {total_debit:,.2f}')
+    c2.metric('Total Cr', f'RM {total_credit:,.2f}')
+    c3.metric('Difference', f'RM {total_debit-total_credit:,.2f}')
 
     ready_for_month = not errors
     if errors:
-        st.warning("This JV will remain DRAFT until all validation issues are cleared.")
-        with st.expander("Validation issues"):
+        st.warning('This JV will remain DRAFT until all validation issues are cleared.')
+        with st.expander('Validation issues'):
             for error in errors:
-                st.write(f"• {error}")
+                st.write(f'• {error}')
     else:
-        st.success("READY for monthly submission ✓")
+        st.success('READY for monthly submission ✓')
 
     c1,c2 = st.columns(2)
     with c1:
         if st.button(
-            "Save JV Changes",
-            type="primary",
+            'Save JV Changes',
+            type='primary',
             use_container_width=True,
-            key=f"save_working_jv_{jv_id}"
+            key=f'save_working_jv_{jv_id}'
         ):
             new_status = update_working_jv(
-                jv_id,selected_type,draft_remarks,draft_df,
+                jv_id,current_type,draft_remarks,draft_df,
                 total_debit,total_credit,draft_files,
                 employee_no,employee_name,ready_for_month
             )
-            st.success(f"{jv_number} saved with status {new_status}.")
+            clear_journal_editor_state(f'draft_editor_{jv_id}')
+            st.success(f'{jv_number} saved with status {new_status}.')
             st.rerun()
 
     with c2:
         confirm_cancel = st.checkbox(
-            "Confirm cancel",
-            key=f"confirm_cancel_draft_{jv_id}"
+            'Confirm cancel',
+            key=f'confirm_cancel_draft_{jv_id}'
         )
         if st.button(
-            "Cancel JV",
+            'Cancel JV',
             use_container_width=True,
             disabled=not confirm_cancel,
-            key=f"cancel_draft_{jv_id}"
+            key=f'cancel_draft_{jv_id}'
         ):
             conn = get_connection()
             conn.execute(
@@ -2458,11 +2555,12 @@ def render_draft_controls(jv_id, employee_no, employee_name):
             )
             conn.commit(); conn.close()
             cancel_draft(jv_id, employee_no, employee_name)
+            clear_journal_editor_state(f'draft_editor_{jv_id}')
             st.session_state.myjv_jv_id = None
             st.session_state.dashboard_jv_id = None
-            st.success(f"{jv_number} cancelled.")
+            st.session_state.workspace_jv_id = None
+            st.success(f'{jv_number} cancelled.')
             st.rerun()
-
 
 
 def month_has_been_submitted(accounting_period, employee_no):
@@ -3107,11 +3205,10 @@ def update_and_resubmit_jv(
 
 def render_amendment_controls(jv_id, employee_no, employee_name):
 
-    if role != "PREPARER":
+    if role != 'PREPARER':
         return
 
     conn = get_connection()
-
     header = conn.execute("""
         SELECT
             jv_number,
@@ -3119,13 +3216,12 @@ def render_amendment_controls(jv_id, employee_no, employee_name):
             accounting_period,
             remarks,
             status,
-            prepared_by,
             reviewer_comments,
+            prepared_by,
             revision_no
         FROM jv_headers
         WHERE id = ?
     """, (jv_id,)).fetchone()
-
     conn.close()
 
     if not header:
@@ -3137,161 +3233,48 @@ def render_amendment_controls(jv_id, employee_no, employee_name):
         accounting_period,
         current_remarks,
         status,
-        prepared_by,
         reviewer_comments,
+        prepared_by,
         revision_no
     ) = header
 
-    if status != "AMENDMENT REQUIRED":
-        return
-
-    if prepared_by != employee_no:
-        return
-
-    if not is_period_open(accounting_period):
-        st.divider()
-        st.error(
-            f"{month_label(accounting_period)} is CLOSED. "
-            "Amendment and resubmission are locked."
-        )
+    if status != 'AMENDMENT REQUIRED' or prepared_by != employee_no:
         return
 
     st.divider()
-    st.warning("Amendment required")
+    st.subheader('Amend JV')
 
     if reviewer_comments:
-        st.write(f"**Reviewer comments:** {reviewer_comments}")
+        st.warning(f'Reviewer Comments: {reviewer_comments}')
 
-    if st.session_state.amend_jv_id != jv_id:
-
-        if st.button(
-            "Amend JV",
-            type="primary",
-            key=f"start_amend_{jv_id}"
-        ):
-            st.session_state.amend_jv_id = jv_id
-            st.rerun()
-
+    if not is_period_open(accounting_period):
+        st.error(
+            f'{month_label(accounting_period)} is CLOSED. '
+            'This JV cannot be amended.'
+        )
         return
 
-    st.subheader("Amend & Resubmit")
-
-    st.caption(
-        f"JV No. {jv_number} remains unchanged. "
-        f"Accounting month: {month_label(accounting_period)}. "
-        f"Current revision: {int(revision_no or 1)}"
-    )
-
-    type_options = get_jv_type_options(
-        include_inactive=True
-    )
-
-    current_type_label = current_type
-
-    if not jv_type_is_active(current_type):
-        current_type_label = f"{current_type} [INACTIVE]"
-
-    if current_type_label not in type_options:
-        type_options.insert(
-            0,
-            current_type_label
-        )
-
-    type_index = (
-        type_options.index(current_type_label)
-        if current_type_label in type_options
-        else 0
-    )
-
-    amended_type_display = st.selectbox(
-        "JV Type",
-        type_options,
-        index=type_index,
-        key=f"amend_type_{jv_id}"
-    )
-
-    amended_type = clean_jv_type_label(
-        amended_type_display
-    )
-
-    amended_type_rule = get_jv_type_rule(
-        amended_type
-    )
-
-    if amended_type_rule:
-        attachment_rule_text = amended_type_rule["attachment_rule"].title()
-
-        st.caption(
-            f"Supporting document rule: {attachment_rule_text}"
-        )
-
-        if amended_type_rule["notes"]:
-            st.caption(
-                amended_type_rule["notes"]
-            )
-
     amended_remarks = st.text_input(
-        "JV Description / Remarks",
-        value=current_remarks or "",
-        key=f"amend_remarks_{jv_id}"
+        'JV Description / Remarks',
+        value=current_remarks or '',
+        key=f'amend_remarks_{jv_id}'
     )
 
     edit_df = get_jv_lines_for_edit(jv_id)
-
-    amended_df = st.data_editor(
+    amended_df = render_auto_gl_editor(
         edit_df,
-        num_rows="dynamic",
-        hide_index=True,
-        use_container_width=True,
-        column_config={
-            "Date": st.column_config.DateColumn(
-                "Date",
-                format="DD/MM/YYYY"
-            ),
-            "A/C Code": st.column_config.SelectboxColumn(
-                "A/C Code",
-                options=get_gl_options(include_inactive=True)
-            ),
-            "Description": st.column_config.TextColumn(
-                "Description",
-                width="large"
-            ),
-            "Dr": st.column_config.NumberColumn(
-                "Dr",
-                min_value=0.00,
-                format="%.2f"
-            ),
-            "Cr": st.column_config.NumberColumn(
-                "Cr",
-                min_value=0.00,
-                format="%.2f"
-            )
-        },
-        key=f"amend_editor_{jv_id}"
+        key_prefix=f'amend_editor_{jv_id}',
+        include_inactive=True
     )
 
     amendment_files = st.file_uploader(
-        "Add Supporting Documents (Optional)",
-        type=[
-            "pdf",
-            "xlsx",
-            "xls",
-            "docx",
-            "jpg",
-            "jpeg",
-            "png"
-        ],
+        'Add Supporting Documents (Optional)',
+        type=['pdf','xlsx','xls','docx','jpg','jpeg','png'],
         accept_multiple_files=True,
-        key=f"amend_files_{jv_id}"
-    )
-
-    st.caption(
-        "A file with the same filename will replace the current active copy. "
-        "The previous copy remains retained internally."
+        key=f'amend_files_{jv_id}'
     )
 
     errors, total_debit, total_credit = validate_journal(amended_df)
-
     errors.extend(
         validate_journal_dates_against_period(
             amended_df,
@@ -3299,87 +3282,48 @@ def render_amendment_controls(jv_id, employee_no, employee_name):
         )
     )
 
-    if not jv_type_is_active(amended_type):
-        errors.append(
-            "Selected JV Type is inactive or invalid."
-        )
-
-    if (
-        amended_type_rule
-        and amended_type_rule["attachment_rule"] == "REQUIRED"
-    ):
-        existing_active_attachments = get_active_attachments(jv_id)
-
-        if not existing_active_attachments and not amendment_files:
-            errors.append(
-                f"Supporting document is required for JV Type: {amended_type}."
-            )
-
-    c1, c2, c3 = st.columns(3)
-
-    c1.metric("Total Dr", f"RM {total_debit:,.2f}")
-    c2.metric("Total Cr", f"RM {total_credit:,.2f}")
-    c3.metric(
-        "Difference",
-        f"RM {total_debit - total_credit:,.2f}"
-    )
+    c1,c2,c3 = st.columns(3)
+    c1.metric('Total Dr', f'RM {total_debit:,.2f}')
+    c2.metric('Total Cr', f'RM {total_credit:,.2f}')
+    c3.metric('Difference', f'RM {total_debit-total_credit:,.2f}')
 
     if errors:
-
-        st.error("JV not ready for resubmission.")
-
-        with st.expander("Validation issues"):
+        st.warning('Please resolve the validation issues before resubmitting.')
+        with st.expander('Validation issues'):
             for error in errors:
-                st.write(f"• {error}")
-
-        resubmit_disabled = True
-
+                st.write(f'• {error}')
     else:
-        st.success("Balanced ✓")
-        resubmit_disabled = False
+        st.success('Amendment is ready for resubmission ✓')
 
-    c1, c2 = st.columns(2)
+    if st.button(
+        'Resubmit JV',
+        type='primary',
+        use_container_width=True,
+        disabled=bool(errors),
+        key=f'resubmit_jv_{jv_id}'
+    ):
+        new_revision = update_and_resubmit_jv(
+            jv_id,
+            current_type,
+            amended_remarks,
+            amended_df,
+            total_debit,
+            total_credit,
+            amendment_files,
+            employee_no,
+            employee_name
+        )
 
-    with c1:
-        if st.button(
-            "Cancel Amendment",
-            use_container_width=True,
-            key=f"cancel_amend_{jv_id}"
-        ):
-            st.session_state.amend_jv_id = None
-            st.rerun()
+        clear_journal_editor_state(f'amend_editor_{jv_id}')
+        st.session_state.amend_jv_id = None
+        st.session_state.myjv_jv_id = None
+        st.session_state.dashboard_jv_id = None
+        st.session_state.workspace_jv_id = None
 
-    with c2:
-        if st.button(
-            "Resubmit for Approval",
-            type="primary",
-            disabled=resubmit_disabled,
-            use_container_width=True,
-            key=f"resubmit_{jv_id}"
-        ):
-
-            new_revision = update_and_resubmit_jv(
-                jv_id,
-                amended_type,
-                amended_remarks,
-                amended_df,
-                total_debit,
-                total_credit,
-                amendment_files,
-                employee_no,
-                employee_name
-            )
-
-            st.session_state.amend_jv_id = None
-            st.session_state.myjv_jv_id = None
-            st.session_state.dashboard_jv_id = None
-
-            st.success(
-                f"{jv_number} resubmitted successfully "
-                f"as Revision {new_revision}."
-            )
-
-            st.rerun()
+        st.success(
+            f'{jv_number} resubmitted successfully as Revision {new_revision}.'
+        )
+        st.rerun()
 
 
 def get_jv_lines(jv_id):
@@ -3391,7 +3335,6 @@ def get_jv_lines(jv_id):
             line_no AS "Line",
             line_date AS "Date",
             gl_code AS "A/C Code",
-            description AS "Description",
             debit AS "Dr",
             credit AS "Cr"
         FROM jv_lines
@@ -3402,7 +3345,13 @@ def get_jv_lines(jv_id):
     conn.close()
 
     if not df.empty:
-        df["Date"] = df["Date"].apply(display_date)
+        df['Date'] = df['Date'].apply(display_date)
+        gl_map = get_gl_description_map()
+        df.insert(
+            3,
+            'Description',
+            df['A/C Code'].astype(str).map(gl_map).fillna('')
+        )
 
     return df
 
@@ -3471,21 +3420,17 @@ def show_jv_detail(jv_id):
 
     st.subheader(jv_number)
 
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3 = st.columns(3)
 
     c1.write(
         f"**Month**  \n{month_label(accounting_period)}"
     )
 
     c2.write(
-        f"**JV Type**  \n{jv_type}"
-    )
-
-    c3.write(
         f"**Status**  \n{status}"
     )
 
-    c4.write(
+    c3.write(
         f"**Amount**  \nRM {total_debit:,.2f}"
     )
 
@@ -3802,7 +3747,8 @@ defaults = {
 
     # Safe programmatic sidebar navigation
     "requested_page": None,
-    "nav_version": 0
+    "nav_version": 0,
+    "gl_import_result": None
 }
 
 for key, value in defaults.items():
@@ -3840,7 +3786,9 @@ def login(employee_no, password):
     st.session_state.employee_no = db_employee_no
     st.session_state.user_name = employee_name
     st.session_state.role = user_role
-    st.session_state.page = "Dashboard"
+    st.session_state.page = (
+        "Search JVs" if user_role == "AUDITOR" else "Dashboard"
+    )
     return True
 
 
@@ -3881,7 +3829,7 @@ def get_month_workspace_jvs(accounting_period, employee_no):
         WHERE accounting_period = ?
         AND prepared_by = ?
         AND status != 'CANCELLED'
-        ORDER BY id
+        ORDER BY jv_number ASC
     """, (
         period_key(accounting_period),
         employee_no
@@ -4060,7 +4008,6 @@ with st.sidebar:
     elif role == "AUDITOR":
 
         menu_options = [
-            "Dashboard",
             "Search JVs",
             "Audit Trail"
         ]
@@ -4076,7 +4023,6 @@ with st.sidebar:
             "Dashboard",
             "User Management",
             "G/L Master",
-            "JV Type Master",
             "Period Control"
         ]
 
@@ -4295,13 +4241,10 @@ if st.session_state.page == "Dashboard":
         )).fetchone()[0]
 
         returned_count = conn.execute("""
-            SELECT COUNT(DISTINCT jv_id)
-            FROM audit_log
-            WHERE employee_no = ?
-            AND event_type = 'JV_RETURNED'
-        """, (
-            employee_no,
-        )).fetchone()[0]
+            SELECT COUNT(*)
+            FROM jv_headers
+            WHERE status = 'AMENDMENT REQUIRED'
+        """).fetchone()[0]
 
         c1, c2, c3 = st.columns(3)
 
@@ -4445,16 +4388,15 @@ if st.session_state.page == "Dashboard":
             configured_open_periods
         )
 
-        active_jv_type_count = conn.execute("""
+        pending_pic_count = conn.execute("""
             SELECT COUNT(*)
-            FROM jv_type_master
-            WHERE entity = 'JKPSD'
-            AND status = 'ACTIVE'
+            FROM pic_requests
+            WHERE status = 'PENDING'
         """).fetchone()[0]
 
         c4.metric(
-            "JV Types",
-            active_jv_type_count
+            "Pending PIC Requests",
+            pending_pic_count
         )
 
     conn.close()
@@ -4538,12 +4480,13 @@ if st.session_state.page == "Dashboard":
                 SELECT
                     id,
                     jv_number,
-                    jv_type,
+                    remarks,
                     total_debit,
                     status,
                     prepared_name
                 FROM jv_headers
                 WHERE accounting_period = ?
+                AND status != 'CANCELLED'
             """
 
             params = [
@@ -4618,17 +4561,8 @@ if st.session_state.page == "Dashboard":
                 elif selected_status == "RETURNED":
 
                     query += """
-                        AND id IN (
-                            SELECT jv_id
-                            FROM audit_log
-                            WHERE employee_no = ?
-                            AND event_type = 'JV_RETURNED'
-                        )
+                        AND status = 'AMENDMENT REQUIRED'
                     """
-
-                    params.append(
-                        employee_no
-                    )
 
             elif role == "AUDITOR":
 
@@ -4654,7 +4588,7 @@ if st.session_state.page == "Dashboard":
                     """
 
             query += """
-                ORDER BY id DESC
+                ORDER BY jv_number ASC
             """
 
             result = conn.execute(
@@ -4677,7 +4611,7 @@ if st.session_state.page == "Dashboard":
                     (
                         jv_id,
                         jv_number,
-                        jv_type,
+                        jv_description,
                         amount,
                         status,
                         preparer
@@ -4692,7 +4626,7 @@ if st.session_state.page == "Dashboard":
                     )
 
                     c2.write(
-                        jv_type
+                        jv_description or "-"
                     )
 
                     c3.write(
@@ -4706,8 +4640,17 @@ if st.session_state.page == "Dashboard":
                             key=f"dash_open_{jv_id}"
                         ):
 
-                            st.session_state.dashboard_jv_id = jv_id
-                            st.rerun()
+                            if role == "PREPARER":
+                                st.session_state.workspace_jv_id = jv_id
+                                request_navigation("Create / Save JV")
+
+                            elif role == "APPROVER":
+                                st.session_state.approval_jv_id = jv_id
+                                request_navigation("Approval Inbox")
+
+                            elif role == "AUDITOR":
+                                st.session_state.search_jv_id = jv_id
+                                request_navigation("Search JVs")
 
                     st.caption(
                         f"{status} | Preparer: {preparer}"
@@ -4799,17 +4742,8 @@ if st.session_state.page == "Dashboard":
                 elif selected_status == "RETURNED":
 
                     query += """
-                        AND id IN (
-                            SELECT jv_id
-                            FROM audit_log
-                            WHERE employee_no = ?
-                            AND event_type = 'JV_RETURNED'
-                        )
+                        AND status = 'AMENDMENT REQUIRED'
                     """
-
-                    params.append(
-                        employee_no
-                    )
 
             elif role == "AUDITOR":
 
@@ -4909,7 +4843,8 @@ elif st.session_state.page == "Create / Save JV":
                 jv_number,
                 accounting_period,
                 status,
-                prepared_by
+                prepared_by,
+                remarks
             FROM jv_headers
             WHERE id = ?
         """, (
@@ -4922,7 +4857,7 @@ elif st.session_state.page == "Create / Save JV":
             st.session_state.workspace_jv_id = None
             st.stop()
 
-        current_jv_number, current_period, current_status, current_preparer = current_header
+        current_jv_number, current_period, current_status, current_preparer, current_remarks = current_header
 
         if current_preparer != employee_no:
             st.error("Access denied.")
@@ -5000,14 +4935,11 @@ elif st.session_state.page == "Create / Save JV":
                         1
                     )
 
-                    for widget_key in [
-                        "journal_editor",
-                        "create_remarks",
-                        "create_supporting_docs",
-                        "create_jv_type"
-                    ]:
-                        if widget_key in st.session_state:
-                            del st.session_state[widget_key]
+                    st.session_state.create_remarks = current_remarks or ""
+
+                    clear_journal_editor_state("create_journal_editor")
+                    if "create_supporting_docs" in st.session_state:
+                        del st.session_state["create_supporting_docs"]
 
                     st.rerun()
             else:
@@ -5096,14 +5028,9 @@ elif st.session_state.page == "Create / Save JV":
                 st.session_state.last_saved_jv_status = None
                 st.session_state.last_saved_jv_id = None
 
-                for widget_key in [
-                    "journal_editor",
-                    "create_remarks",
-                    "create_supporting_docs",
-                    "create_jv_type"
-                ]:
-                    if widget_key in st.session_state:
-                        del st.session_state[widget_key]
+                clear_journal_editor_state("create_journal_editor")
+                if "create_supporting_docs" in st.session_state:
+                    del st.session_state["create_supporting_docs"]
 
                 st.rerun()
 
@@ -5156,39 +5083,25 @@ elif st.session_state.page == "Create / Save JV":
             f"## {jv_number}"
         )
 
-    c1, c2 = st.columns(2)
+    jv_type = DEFAULT_JV_TYPE
 
-    with c1:
-
-        active_jv_types = get_jv_type_options(
-            include_inactive=False
+    if "create_remarks" not in st.session_state:
+        previous_remarks = get_last_jv_remarks(
+            accounting_period,
+            employee_no
         )
-
-        jv_type = st.selectbox(
-            "JV Type",
-            active_jv_types,
-            key="create_jv_type"
-        )
-
-        selected_jv_type_rule = get_jv_type_rule(
-            jv_type
-        )
-
-        if selected_jv_type_rule:
-            st.caption(
-                "Supporting document: "
-                f"{selected_jv_type_rule['attachment_rule'].title()}"
-            )
-
-            if selected_jv_type_rule["notes"]:
-                st.caption(
-                    selected_jv_type_rule["notes"]
-                )
+        if previous_remarks:
+            st.session_state.create_remarks = previous_remarks
 
     remarks = st.text_input(
         "JV Description / Remarks",
         key="create_remarks"
     )
+
+    if remarks and get_last_jv_remarks(accounting_period, employee_no) == remarks:
+        st.caption(
+            "Description carried forward from the previous JV. Review before saving."
+        )
 
     if selected_period_status == "CLOSED":
         st.error(
@@ -5225,36 +5138,10 @@ elif st.session_state.page == "Create / Save JV":
         ]
     )
 
-    journal_df = st.data_editor(
+    journal_df = render_auto_gl_editor(
         initial_journal,
-        num_rows="dynamic",
-        hide_index=True,
-        use_container_width=True,
-        column_config={
-            "Date": st.column_config.DateColumn(
-                "Date",
-                format="DD/MM/YYYY"
-            ),
-            "A/C Code": st.column_config.SelectboxColumn(
-                "A/C Code",
-                options=get_gl_options(include_inactive=False)
-            ),
-            "Description": st.column_config.TextColumn(
-                "Description",
-                width="large"
-            ),
-            "Dr": st.column_config.NumberColumn(
-                "Dr",
-                min_value=0.00,
-                format="%.2f"
-            ),
-            "Cr": st.column_config.NumberColumn(
-                "Cr",
-                min_value=0.00,
-                format="%.2f"
-            )
-        },
-        key="journal_editor"
+        key_prefix="create_journal_editor",
+        include_inactive=False
     )
 
     debit_series = pd.to_numeric(
@@ -5303,15 +5190,7 @@ elif st.session_state.page == "Create / Save JV":
 
     st.divider()
 
-    attachment_label = "Supporting Documents"
-
-    if (
-        selected_jv_type_rule
-        and selected_jv_type_rule["attachment_rule"] == "REQUIRED"
-    ):
-        attachment_label += " (Required)"
-    else:
-        attachment_label += " (Optional)"
+    attachment_label = "Supporting Documents (Optional)"
 
     uploaded_files = st.file_uploader(
         attachment_label,
@@ -5436,20 +5315,6 @@ elif st.session_state.page == "Create / Save JV":
         )
     )
 
-    if not jv_type_is_active(jv_type):
-        errors.append(
-            "Selected JV Type is inactive or invalid."
-        )
-
-    if (
-        selected_jv_type_rule
-        and selected_jv_type_rule["attachment_rule"] == "REQUIRED"
-        and not uploaded_files
-    ):
-        errors.append(
-            f"Supporting document is required for JV Type: {jv_type}."
-        )
-
     if selected_period_status == "CLOSED":
         errors.append(
             "Submission is not allowed because the accounting period is CLOSED."
@@ -5492,15 +5357,12 @@ elif st.session_state.page == "Create / Save JV":
         st.session_state.last_saved_jv_status = saved_status
         st.session_state.show_saved_jv_confirmation = True
 
-        for widget_key in [
-            "journal_editor",
-            "create_remarks",
-            "create_supporting_docs",
-            "create_jv_type"
-        ]:
-            if widget_key in st.session_state:
-                del st.session_state[widget_key]
+        clear_journal_editor_state("create_journal_editor")
 
+        if "create_supporting_docs" in st.session_state:
+            del st.session_state["create_supporting_docs"]
+
+        # Keep JV Description / Remarks as a deliberate carry-forward aid.
         st.rerun()
 
 
@@ -5554,14 +5416,14 @@ elif st.session_state.page == "Monthly Workspace":
                         1
                     )
 
-                    for widget_key in [
-                        "journal_editor",
-                        "create_remarks",
-                        "create_supporting_docs",
-                        "create_jv_type"
-                    ]:
-                        if widget_key in st.session_state:
-                            del st.session_state[widget_key]
+                    clear_journal_editor_state("create_journal_editor")
+                    if "create_supporting_docs" in st.session_state:
+                        del st.session_state["create_supporting_docs"]
+
+                    # Carry the most recent description for this month into the new JV.
+                    st.session_state.create_remarks = get_last_jv_remarks(
+                        selected_month, employee_no
+                    )
 
                     request_navigation("Create / Save JV")
             else:
@@ -5582,21 +5444,21 @@ elif st.session_state.page == "Monthly Workspace":
 
         conn = get_connection()
         rows = conn.execute("""
-            SELECT id,jv_number,jv_type,total_debit,status
+            SELECT id,jv_number,remarks,total_debit,status
             FROM jv_headers
             WHERE prepared_by=? AND accounting_period=?
             AND status != 'CANCELLED'
-            ORDER BY id
+            ORDER BY jv_number ASC
         """, (employee_no,selected_month)).fetchall()
         conn.close()
 
         if not rows:
             st.info("No JV records for this month.")
         else:
-            for jv_id,jv_number,jv_type,amount,status in rows:
+            for jv_id,jv_number,jv_description,amount,status in rows:
                 c1,c2,c3,c4 = st.columns([2,2,2,1])
                 c1.write(f"**{jv_number}**")
-                c2.write(jv_type)
+                c2.write(jv_description or "-")
                 c3.write(f"RM {amount:,.2f}  \n{status}")
                 with c4:
                     if st.button(
@@ -5761,13 +5623,14 @@ elif st.session_state.page == "My JVs":
             SELECT
                 id,
                 jv_number,
-                jv_type,
+                remarks,
                 total_debit,
                 status
             FROM jv_headers
             WHERE prepared_by = ?
             AND accounting_period = ?
-            ORDER BY id DESC
+            AND status != 'CANCELLED'
+            ORDER BY jv_number ASC
         """, (
             employee_no,
             selected_month
@@ -5783,18 +5646,26 @@ elif st.session_state.page == "My JVs":
 
         else:
 
+            h1, h2, h3, h4, h5 = st.columns([1.5, 3.5, 1.5, 1.5, 1])
+            h1.markdown("**JV No.**")
+            h2.markdown("**Description**")
+            h3.markdown("**Amount**")
+            h4.markdown("**Status**")
+            h5.markdown("**Action**")
+            st.divider()
+
             for row in rows:
 
                 (
                     jv_id,
                     jv_number,
-                    jv_type,
+                    jv_description,
                     amount,
                     status
                 ) = row
 
-                c1, c2, c3, c4 = st.columns(
-                    [2, 2, 2, 1]
+                c1, c2, c3, c4, c5 = st.columns(
+                    [1.5, 3.5, 1.5, 1.5, 1]
                 )
 
                 c1.write(
@@ -5802,26 +5673,25 @@ elif st.session_state.page == "My JVs":
                 )
 
                 c2.write(
-                    jv_type
+                    jv_description or "-"
                 )
 
                 c3.write(
                     f"RM {amount:,.2f}"
                 )
 
-                with c4:
+                c4.write(status)
+
+                with c5:
 
                     if st.button(
                         "Open",
-                        key=f"myjv_open_{jv_id}"
+                        key=f"myjv_open_{jv_id}",
+                        use_container_width=True
                     ):
 
-                        st.session_state.myjv_jv_id = jv_id
-                        st.rerun()
-
-                st.caption(
-                    status
-                )
+                        st.session_state.workspace_jv_id = jv_id
+                        request_navigation("Create / Save JV")
 
                 st.divider()
 
@@ -5837,6 +5707,7 @@ elif st.session_state.page == "My JVs":
                 COUNT(*)
             FROM jv_headers
             WHERE prepared_by = ?
+            AND status != 'CANCELLED'
             GROUP BY accounting_period
             ORDER BY accounting_period DESC
         """, (
@@ -5919,7 +5790,8 @@ elif st.session_state.page == "Approval Inbox":
             SELECT
                 jv_number,
                 prepared_by,
-                accounting_period
+                accounting_period,
+                status
             FROM jv_headers
             WHERE id = ?
         """, (
@@ -5931,6 +5803,7 @@ elif st.session_state.page == "Approval Inbox":
         selected_jv_number = selected_row[0]
         preparer_no = selected_row[1]
         selected_accounting_period = selected_row[2]
+        selected_status = selected_row[3]
         approval_period_open = is_period_open(selected_accounting_period)
 
         if not approval_period_open:
@@ -5938,6 +5811,12 @@ elif st.session_state.page == "Approval Inbox":
                 f"{month_label(selected_accounting_period)} is CLOSED. "
                 "Approval and return actions are locked."
             )
+
+        if selected_status not in ("PENDING APPROVAL", "RESUBMITTED"):
+            st.info(
+                f"This JV is currently {selected_status}. No approval action is required."
+            )
+            st.stop()
 
         comments = st.text_area(
             "Reviewer Comments"
@@ -6117,7 +5996,7 @@ elif st.session_state.page == "Approval Inbox":
             SELECT
                 id,
                 jv_number,
-                jv_type,
+                remarks,
                 total_debit,
                 prepared_name,
                 status
@@ -6127,7 +6006,7 @@ elif st.session_state.page == "Approval Inbox":
                 'PENDING APPROVAL',
                 'RESUBMITTED'
             )
-            ORDER BY id DESC
+            ORDER BY jv_number ASC
         """, (
             selected_month,
         )).fetchall()
@@ -6147,7 +6026,7 @@ elif st.session_state.page == "Approval Inbox":
                 (
                     jv_id,
                     jv_number,
-                    jv_type,
+                    jv_description,
                     amount,
                     preparer,
                     status
@@ -6162,7 +6041,7 @@ elif st.session_state.page == "Approval Inbox":
                 )
 
                 c2.write(
-                    jv_type
+                    jv_description or "-"
                 )
 
                 c3.write(
@@ -6301,8 +6180,7 @@ elif st.session_state.page == "Search JVs":
                 "AMENDMENT REQUIRED",
                 "RESUBMITTED",
                 "APPROVED",
-                "POSTED TO UBS",
-                "CANCELLED"
+                "POSTED TO UBS"
             ]
 
             if role == "AUDITOR":
@@ -6337,13 +6215,6 @@ elif st.session_state.page == "Search JVs":
             search_month_name = st.selectbox(
                 "Month",
                 month_names_search
-            )
-
-            search_type = st.selectbox(
-                "JV Type",
-                ["ALL"] + get_jv_type_options(
-                    include_inactive=True
-                )
             )
 
             search_gl = st.text_input(
@@ -6405,7 +6276,7 @@ elif st.session_state.page == "Search JVs":
                 j.id,
                 j.jv_number,
                 j.accounting_period,
-                j.jv_type,
+                j.remarks,
                 j.total_debit,
                 j.status,
                 j.prepared_by,
@@ -6417,6 +6288,7 @@ elif st.session_state.page == "Search JVs":
             LEFT JOIN jv_lines l
                 ON j.id = l.jv_id
             WHERE 1 = 1
+            AND j.status != 'CANCELLED'
         """
 
         params = []
@@ -6460,12 +6332,6 @@ elif st.session_state.page == "Search JVs":
         if search_status != "ALL":
             query += " AND j.status = ?"
             params.append(search_status)
-
-        if search_type != "ALL":
-            query += " AND j.jv_type = ?"
-            params.append(
-                clean_jv_type_label(search_type)
-            )
 
         if search_gl.strip():
             query += " AND UPPER(l.gl_code) LIKE UPPER(?)"
@@ -6511,7 +6377,7 @@ elif st.session_state.page == "Search JVs":
                 approval_date_to.strftime("%Y-%m-%d")
             ])
 
-        query += " ORDER BY j.accounting_period DESC, j.id DESC"
+        query += " ORDER BY j.accounting_period DESC, j.jv_number ASC"
 
         conn = get_connection()
 
@@ -6543,7 +6409,7 @@ elif st.session_state.page == "Search JVs":
                     jv_id,
                     jv_number,
                     accounting_period,
-                    jv_type,
+                    jv_description,
                     amount,
                     status,
                     prepared_by,
@@ -6562,7 +6428,7 @@ elif st.session_state.page == "Search JVs":
                 )
 
                 c2.write(
-                    f"{month_label(accounting_period)}  \n{jv_type}"
+                    f"{month_label(accounting_period)}  \n{jv_description or '-'}"
                 )
 
                 c3.write(
@@ -6607,11 +6473,6 @@ elif st.session_state.page == "Audit Trail":
         st.stop()
 
     st.header("Audit Trail")
-    st.caption(
-        "Read-only final audit activities. Amendment and resubmission history "
-        "is not displayed in the Auditor view."
-    )
-
     c1, c2, c3 = st.columns(3)
 
     with c1:
@@ -6934,7 +6795,7 @@ elif st.session_state.page == "User Management":
                     "Temporary Password",
                     type="password",
                     key=f"temp_password_{request_id}",
-                    help="Minimum 8 characters."
+                    help="Enter any temporary password."
                 )
 
                 admin_comment = st.text_input(
@@ -7139,10 +7000,11 @@ elif st.session_state.page == "G/L Master":
         "Only ACTIVE G/L codes are available for new Journal Vouchers."
     )
 
-    tab1, tab2, tab3 = st.tabs(
+    tab1, tab2, tab3, tab4 = st.tabs(
         [
             "G/L List",
             "Add / Update G/L",
+            "Import Excel",
             "Change History"
         ]
     )
@@ -7602,10 +7464,367 @@ elif st.session_state.page == "G/L Master":
                         st.rerun()
 
     # -----------------------------------------------------
-    # HISTORY
+    # IMPORT EXCEL
     # -----------------------------------------------------
 
     with tab3:
+
+        st.caption(
+            "Bulk upload the G/L Master from Excel. "
+            "The file will be validated before anything is saved."
+        )
+
+        required_columns = [
+            "G/L Code",
+            "G/L Description",
+            "Account Category",
+            "Debit / Credit Classification",
+            "Status",
+            "Effective Date",
+            "Entity",
+            "Cost Centre Required",
+            "Additional Validation Notes"
+        ]
+
+        st.write(
+            "**Required Excel columns:** "
+            + ", ".join(required_columns)
+        )
+
+        duplicate_action = st.radio(
+            "If G/L Code already exists",
+            [
+                "Skip existing G/L",
+                "Update existing G/L"
+            ],
+            horizontal=True,
+            key="gl_import_duplicate_action"
+        )
+
+        uploaded_gl_file = st.file_uploader(
+            "Upload G/L Master Excel",
+            type=["xlsx", "xls"],
+            key="gl_master_excel_upload"
+        )
+
+        if uploaded_gl_file is not None:
+
+            try:
+                import_df = pd.read_excel(uploaded_gl_file)
+
+                import_df.columns = [
+                    str(col).strip()
+                    for col in import_df.columns
+                ]
+
+                missing_columns = [
+                    col
+                    for col in required_columns
+                    if col not in import_df.columns
+                ]
+
+                if missing_columns:
+                    st.error(
+                        "Import cannot continue. Missing column(s): "
+                        + ", ".join(missing_columns)
+                    )
+
+                else:
+                    import_df = import_df[required_columns].copy()
+
+                    text_columns = [
+                        "G/L Code",
+                        "G/L Description",
+                        "Account Category",
+                        "Debit / Credit Classification",
+                        "Status",
+                        "Entity",
+                        "Additional Validation Notes"
+                    ]
+
+                    for col in text_columns:
+                        import_df[col] = (
+                            import_df[col]
+                            .fillna("")
+                            .astype(str)
+                            .str.strip()
+                        )
+
+                    import_df["Debit / Credit Classification"] = (
+                        import_df["Debit / Credit Classification"].str.upper()
+                    )
+                    import_df["Status"] = import_df["Status"].str.upper()
+
+                    def parse_yes_no(value):
+                        if pd.isna(value):
+                            return None
+                        value = str(value).strip().upper()
+                        if value in ["YES", "Y", "TRUE", "1"]:
+                            return 1
+                        if value in ["NO", "N", "FALSE", "0"]:
+                            return 0
+                        return None
+
+                    import_df["Cost Centre Parsed"] = (
+                        import_df["Cost Centre Required"].apply(parse_yes_no)
+                    )
+
+                    import_df["Effective Date Parsed"] = pd.to_datetime(
+                        import_df["Effective Date"],
+                        errors="coerce"
+                    )
+
+                    valid_categories = [
+                        "Asset",
+                        "Liability",
+                        "Equity",
+                        "Income",
+                        "Expense",
+                        "Investment",
+                        "Other"
+                    ]
+
+                    validation_results = []
+                    valid_rows = []
+                    invalid_rows = []
+                    seen_codes = set()
+
+                    for idx, row in import_df.iterrows():
+                        row_no = idx + 2
+                        row_errors = []
+
+                        gl_code = row["G/L Code"]
+                        gl_description = row["G/L Description"]
+                        category = row["Account Category"]
+                        classification = row["Debit / Credit Classification"]
+                        status = row["Status"]
+                        entity = row["Entity"]
+                        cc_required = row["Cost Centre Parsed"]
+                        effective_date = row["Effective Date Parsed"]
+
+                        if not gl_code:
+                            row_errors.append("G/L Code required")
+                        if gl_code in seen_codes:
+                            row_errors.append("Duplicate G/L Code in uploaded file")
+                        seen_codes.add(gl_code)
+
+                        if not gl_description:
+                            row_errors.append("G/L Description required")
+                        if category not in valid_categories:
+                            row_errors.append("Invalid Account Category")
+                        if classification not in ["DEBIT", "CREDIT"]:
+                            row_errors.append("Classification must be DEBIT or CREDIT")
+                        if status not in ["ACTIVE", "INACTIVE"]:
+                            row_errors.append("Status must be ACTIVE or INACTIVE")
+                        if pd.isna(effective_date):
+                            row_errors.append("Invalid Effective Date")
+                        if not entity:
+                            row_errors.append("Entity required")
+                        if cc_required is None:
+                            row_errors.append("Cost Centre Required must be Yes or No")
+
+                        validation_results.append({
+                            "Excel Row": row_no,
+                            "G/L Code": gl_code,
+                            "G/L Description": gl_description,
+                            "Result": "VALID" if not row_errors else "INVALID",
+                            "Validation Message": "" if not row_errors else "; ".join(row_errors)
+                        })
+
+                        if row_errors:
+                            invalid_rows.append(row_no)
+                        else:
+                            valid_rows.append(idx)
+
+                    validation_df = pd.DataFrame(validation_results)
+
+                    st.subheader("Validation Result")
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("Rows", len(import_df))
+                    c2.metric("Valid", len(valid_rows))
+                    c3.metric("Invalid", len(invalid_rows))
+
+                    st.dataframe(
+                        validation_df,
+                        use_container_width=True,
+                        hide_index=True
+                    )
+
+                    if invalid_rows:
+                        st.error(
+                            "Please correct all INVALID rows in Excel "
+                            "and upload the file again before importing."
+                        )
+                    elif import_df.empty:
+                        st.warning("The uploaded Excel file contains no G/L records.")
+                    else:
+                        st.success(
+                            "Validation passed. Review the data below before importing."
+                        )
+
+                        preview_df = import_df[required_columns].copy()
+                        st.subheader("Import Preview")
+                        st.dataframe(
+                            preview_df,
+                            use_container_width=True,
+                            hide_index=True
+                        )
+
+                        confirm_import = st.checkbox(
+                            "I confirm that the uploaded G/L Master has been reviewed.",
+                            key="confirm_gl_import"
+                        )
+
+                        if st.button(
+                            "Import G/L Master",
+                            type="primary",
+                            use_container_width=True,
+                            disabled=not confirm_import,
+                            key="import_gl_master_button"
+                        ):
+                            inserted_count = 0
+                            updated_count = 0
+                            skipped_count = 0
+                            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+                            for _, row in import_df.iterrows():
+                                gl_code = row["G/L Code"]
+                                gl_description = row["G/L Description"]
+                                category = row["Account Category"]
+                                classification = row["Debit / Credit Classification"]
+                                status = row["Status"]
+                                effective_date = row["Effective Date Parsed"].strftime("%Y-%m-%d")
+                                entity = row["Entity"]
+                                cc_required = int(row["Cost Centre Parsed"])
+                                validation_notes = row["Additional Validation Notes"]
+
+                                conn = get_connection()
+                                existing = conn.execute(
+                                    "SELECT 1 FROM gl_master WHERE gl_code = ?",
+                                    (gl_code,)
+                                ).fetchone()
+                                conn.close()
+
+                                if existing:
+                                    if duplicate_action == "Skip existing G/L":
+                                        skipped_count += 1
+                                        continue
+
+                                    log_gl_history(
+                                        gl_code,
+                                        "BEFORE_EXCEL_UPDATE",
+                                        employee_no,
+                                        user_name
+                                    )
+
+                                    conn = get_connection()
+                                    conn.execute("""
+                                        UPDATE gl_master
+                                        SET
+                                            gl_description = ?,
+                                            account_category = ?,
+                                            normal_balance = ?,
+                                            status = ?,
+                                            effective_date = ?,
+                                            entity = ?,
+                                            cost_centre_required = ?,
+                                            validation_notes = ?,
+                                            updated_by = ?,
+                                            updated_at = ?
+                                        WHERE gl_code = ?
+                                    """, (
+                                        gl_description,
+                                        category,
+                                        classification,
+                                        status,
+                                        effective_date,
+                                        entity,
+                                        cc_required,
+                                        validation_notes,
+                                        employee_no,
+                                        now,
+                                        gl_code
+                                    ))
+                                    conn.commit()
+                                    conn.close()
+
+                                    log_gl_history(
+                                        gl_code,
+                                        "AFTER_EXCEL_UPDATE",
+                                        employee_no,
+                                        user_name
+                                    )
+                                    updated_count += 1
+
+                                else:
+                                    conn = get_connection()
+                                    conn.execute("""
+                                        INSERT INTO gl_master (
+                                            gl_code,
+                                            gl_description,
+                                            account_category,
+                                            normal_balance,
+                                            status,
+                                            effective_date,
+                                            entity,
+                                            cost_centre_required,
+                                            validation_notes,
+                                            created_by,
+                                            created_at,
+                                            updated_by,
+                                            updated_at
+                                        )
+                                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                    """, (
+                                        gl_code,
+                                        gl_description,
+                                        category,
+                                        classification,
+                                        status,
+                                        effective_date,
+                                        entity,
+                                        cc_required,
+                                        validation_notes,
+                                        employee_no,
+                                        now,
+                                        employee_no,
+                                        now
+                                    ))
+                                    conn.commit()
+                                    conn.close()
+
+                                    log_gl_history(
+                                        gl_code,
+                                        "EXCEL_IMPORT_CREATED",
+                                        employee_no,
+                                        user_name
+                                    )
+                                    inserted_count += 1
+
+                            st.session_state.gl_import_result = {
+                                "created": inserted_count,
+                                "updated": updated_count,
+                                "skipped": skipped_count
+                            }
+                            st.rerun()
+
+            except Exception as exc:
+                st.error(f"Unable to read the Excel file: {exc}")
+
+        if "gl_import_result" in st.session_state:
+            result = st.session_state.gl_import_result
+            st.success("G/L Master import completed successfully.")
+            r1, r2, r3 = st.columns(3)
+            r1.metric("Created", result.get("created", 0))
+            r2.metric("Updated", result.get("updated", 0))
+            r3.metric("Skipped", result.get("skipped", 0))
+
+
+    # -----------------------------------------------------
+    # HISTORY
+    # -----------------------------------------------------
+
+    with tab4:
 
         conn = get_connection()
 
@@ -7644,374 +7863,8 @@ elif st.session_state.page == "G/L Master":
 
 elif st.session_state.page == "JV Type Master":
 
-    if role != "ADMIN":
-
-        st.error(
-            "Access denied."
-        )
-
-        st.stop()
-
-    st.header(
-        "JV Type Master"
-    )
-
-    st.caption(
-        "Only ACTIVE JV Types can be selected for new Journal Vouchers."
-    )
-
-    tab1, tab2, tab3 = st.tabs(
-        [
-            "JV Type List",
-            "Add / Update",
-            "Change History"
-        ]
-    )
-
-    # -----------------------------------------------------
-    # JV TYPE LIST
-    # -----------------------------------------------------
-
-    with tab1:
-
-        status_filter = st.selectbox(
-            "Status",
-            [
-                "ALL",
-                "ACTIVE",
-                "INACTIVE"
-            ],
-            key="jv_type_status_filter"
-        )
-
-        conn = get_connection()
-
-        query = """
-            SELECT
-                jv_type AS "JV Type",
-                status AS "Status",
-                attachment_rule AS "Supporting Document",
-                supporting_document_notes AS "Document Notes",
-                entity AS "Entity",
-                updated_by AS "Updated By",
-                updated_at AS "Updated At"
-            FROM jv_type_master
-            WHERE entity = 'JKPSD'
-        """
-
-        params = []
-
-        if status_filter != "ALL":
-            query += " AND status = ?"
-            params.append(status_filter)
-
-        query += " ORDER BY jv_type"
-
-        type_df = pd.read_sql_query(
-            query,
-            conn,
-            params=params
-        )
-
-        conn.close()
-
-        if not type_df.empty:
-            type_df["Updated At"] = type_df["Updated At"].apply(
-                display_datetime
-            )
-
-        st.dataframe(
-            type_df,
-            use_container_width=True,
-            hide_index=True
-        )
-
-    # -----------------------------------------------------
-    # ADD / UPDATE
-    # -----------------------------------------------------
-
-    with tab2:
-
-        mode = st.radio(
-            "Action",
-            [
-                "Add New JV Type",
-                "Update Existing JV Type"
-            ],
-            horizontal=True
-        )
-
-        if mode == "Add New JV Type":
-
-            new_type = st.text_input(
-                "JV Type Name",
-                key="new_jv_type_name"
-            )
-
-            attachment_rule = st.selectbox(
-                "Supporting Document Requirement",
-                [
-                    "OPTIONAL",
-                    "REQUIRED"
-                ],
-                key="new_jv_type_attachment"
-            )
-
-            document_notes = st.text_area(
-                "Supporting Document Notes",
-                key="new_jv_type_notes",
-                placeholder=(
-                    "Example: Attach payroll summary and approved payroll schedule."
-                )
-            )
-
-            if st.button(
-                "Add JV Type",
-                type="primary",
-                key="add_jv_type_button"
-            ):
-
-                clean_type = new_type.strip()
-
-                if not clean_type:
-
-                    st.error(
-                        "JV Type Name is required."
-                    )
-
-                else:
-
-                    conn = get_connection()
-
-                    exists = conn.execute(
-                        "SELECT 1 FROM jv_type_master WHERE jv_type = ?",
-                        (clean_type,)
-                    ).fetchone()
-
-                    if exists:
-
-                        conn.close()
-
-                        st.error(
-                            "This JV Type already exists."
-                        )
-
-                    else:
-
-                        now = datetime.now().strftime(
-                            "%Y-%m-%d %H:%M:%S"
-                        )
-
-                        conn.execute("""
-                            INSERT INTO jv_type_master (
-                                jv_type,
-                                status,
-                                attachment_rule,
-                                supporting_document_notes,
-                                entity,
-                                created_by,
-                                created_at,
-                                updated_by,
-                                updated_at
-                            )
-                            VALUES (?, 'ACTIVE', ?, ?, 'JKPSD', ?, ?, ?, ?)
-                        """, (
-                            clean_type,
-                            attachment_rule,
-                            document_notes.strip(),
-                            employee_no,
-                            now,
-                            employee_no,
-                            now
-                        ))
-
-                        conn.commit()
-                        conn.close()
-
-                        log_jv_type_history(
-                            clean_type,
-                            "CREATED",
-                            employee_no,
-                            user_name
-                        )
-
-                        st.success(
-                            f"JV Type '{clean_type}' created and activated."
-                        )
-
-                        st.rerun()
-
-        else:
-
-            conn = get_connection()
-
-            existing_types = conn.execute("""
-                SELECT
-                    jv_type,
-                    status,
-                    attachment_rule,
-                    supporting_document_notes
-                FROM jv_type_master
-                WHERE entity = 'JKPSD'
-                ORDER BY jv_type
-            """).fetchall()
-
-            conn.close()
-
-            if not existing_types:
-
-                st.info(
-                    "No JV Types available."
-                )
-
-            else:
-
-                selected_type = st.selectbox(
-                    "Select JV Type",
-                    [
-                        row[0]
-                        for row in existing_types
-                    ],
-                    key="edit_jv_type_select"
-                )
-
-                selected = next(
-                    row
-                    for row in existing_types
-                    if row[0] == selected_type
-                )
-
-                (
-                    _,
-                    current_status,
-                    current_attachment_rule,
-                    current_notes
-                ) = selected
-
-                status = st.selectbox(
-                    "Status",
-                    [
-                        "ACTIVE",
-                        "INACTIVE"
-                    ],
-                    index=0 if current_status == "ACTIVE" else 1,
-                    key=f"jv_type_status_{selected_type}"
-                )
-
-                rule_options = [
-                    "OPTIONAL",
-                    "REQUIRED"
-                ]
-
-                attachment_rule = st.selectbox(
-                    "Supporting Document Requirement",
-                    rule_options,
-                    index=(
-                        rule_options.index(current_attachment_rule)
-                        if current_attachment_rule in rule_options
-                        else 0
-                    ),
-                    key=f"jv_type_rule_{selected_type}"
-                )
-
-                document_notes = st.text_area(
-                    "Supporting Document Notes",
-                    value=current_notes or "",
-                    key=f"jv_type_notes_{selected_type}"
-                )
-
-                if st.button(
-                    "Save JV Type Changes",
-                    type="primary",
-                    key=f"save_jv_type_{selected_type}"
-                ):
-
-                    log_jv_type_history(
-                        selected_type,
-                        "BEFORE_UPDATE",
-                        employee_no,
-                        user_name
-                    )
-
-                    now = datetime.now().strftime(
-                        "%Y-%m-%d %H:%M:%S"
-                    )
-
-                    conn = get_connection()
-
-                    conn.execute("""
-                        UPDATE jv_type_master
-                        SET
-                            status = ?,
-                            attachment_rule = ?,
-                            supporting_document_notes = ?,
-                            updated_by = ?,
-                            updated_at = ?
-                        WHERE jv_type = ?
-                    """, (
-                        status,
-                        attachment_rule,
-                        document_notes.strip(),
-                        employee_no,
-                        now,
-                        selected_type
-                    ))
-
-                    conn.commit()
-                    conn.close()
-
-                    log_jv_type_history(
-                        selected_type,
-                        "AFTER_UPDATE",
-                        employee_no,
-                        user_name
-                    )
-
-                    st.success(
-                        f"JV Type '{selected_type}' updated."
-                    )
-
-                    st.rerun()
-
-    # -----------------------------------------------------
-    # HISTORY
-    # -----------------------------------------------------
-
-    with tab3:
-
-        conn = get_connection()
-
-        history_df = pd.read_sql_query("""
-            SELECT
-                jv_type AS "JV Type",
-                action AS "Action",
-                changed_by AS "Employee No.",
-                changed_name AS "Changed By",
-                changed_at AS "Changed At"
-            FROM jv_type_history
-            ORDER BY id DESC
-            LIMIT 100
-        """, conn)
-
-        conn.close()
-
-        if history_df.empty:
-
-            st.info(
-                "No JV Type changes recorded yet."
-            )
-
-        else:
-
-            history_df["Changed At"] = history_df["Changed At"].apply(
-                display_datetime
-            )
-
-            st.dataframe(
-                history_df,
-                use_container_width=True,
-                hide_index=True
-            )
+    st.info("JV Type maintenance has been retired from the simplified workflow.")
+    request_navigation("Dashboard")
 
 
 elif st.session_state.page == "Period Control":
