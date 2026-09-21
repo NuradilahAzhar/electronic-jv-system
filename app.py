@@ -1530,6 +1530,15 @@ def log_jv_type_history(jv_type, action, employee_no, employee_name):
     conn.close()
 
 
+def exclude_cancelled_rows(df):
+    """UI safety net: CANCELLED JVs are never shown to users."""
+    if isinstance(df, pd.DataFrame) and "Status" in df.columns:
+        return df[
+            df["Status"].astype(str).str.upper() != "CANCELLED"
+        ].copy()
+    return df
+
+
 def display_date(value):
 
     if not value:
@@ -2580,7 +2589,7 @@ def cancel_draft(jv_id, employee_no, employee_name):
         employee_no,
         employee_name,
         "PREPARER",
-        "Draft cancelled."
+        "Draft cancelled and removed from user-facing views."
     )
 
 
@@ -5768,6 +5777,7 @@ elif st.session_state.page == "My JVs":
             WHERE prepared_by = ?
             AND accounting_period = ?
             AND status != 'CANCELLED'
+            AND status != 'CANCELLED'
             ORDER BY jv_number ASC
         """, (
             employee_no,
@@ -6426,6 +6436,7 @@ elif st.session_state.page == "Search JVs":
             LEFT JOIN jv_lines l
                 ON j.id = l.jv_id
             WHERE 1 = 1
+            AND j.status != 'CANCELLED'
             AND j.status != 'CANCELLED'
         """
 
