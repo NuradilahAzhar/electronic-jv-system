@@ -1027,70 +1027,290 @@ def auto_fill_gl_descriptions(df):
 
 
 def render_auto_gl_editor(base_df, key_prefix, include_inactive=False):
-    """Data editor with G/L code only and read-only auto-filled account description."""
-    data_key = f'{key_prefix}_data'
-    version_key = f'{key_prefix}_version'
+    """
+    Stable row-based journal editor.
 
-    if data_key not in st.session_state:
-        st.session_state[data_key] = auto_fill_gl_descriptions(base_df.copy())
+    A/C Code shows code only.
+    Account Description is automatically displayed from the G/L Master.
+    This avoids mutating a Streamlit data_editor after it has been rendered.
+    """
+    row_count_key = f"{key_prefix}_row_count"
+    initialized_key = f"{key_prefix}_initialized"
 
-    if version_key not in st.session_state:
-        st.session_state[version_key] = 0
+    base_df = base_df.copy()
 
-    editor_key = f'{key_prefix}_{st.session_state[version_key]}'
+    if not st.session_state.get(initialized_key, False):
 
-    edited = st.data_editor(
-        st.session_state[data_key],
-        num_rows='dynamic',
-        hide_index=True,
-        use_container_width=True,
-        column_config={
-            'Date': st.column_config.DateColumn(
-                'Date',
-                format='DD/MM/YYYY'
-            ),
-            'A/C Code': st.column_config.SelectboxColumn(
-                'A/C Code',
-                options=get_gl_code_options(include_inactive=include_inactive)
-            ),
-            'Description': st.column_config.TextColumn(
-                'Description',
-                width='large'
-            ),
-            'Dr': st.column_config.NumberColumn(
-                'Dr',
-                min_value=0.00,
-                format='%.2f'
-            ),
-            'Cr': st.column_config.NumberColumn(
-                'Cr',
-                min_value=0.00,
-                format='%.2f'
+        row_count = max(
+            len(base_df),
+            2
+        )
+
+        st.session_state[row_count_key] = row_count
+
+        for i in range(row_count):
+
+            if i < len(base_df):
+                row = base_df.iloc[i]
+            else:
+                row = {
+                    "Date": None,
+                    "A/C Code": None,
+                    "Description": "",
+                    "Dr": 0.00,
+                    "Cr": 0.00
+                }
+
+            date_value = row.get("Date")
+
+            if pd.isna(date_value):
+                date_value = None
+            elif isinstance(date_value, str):
+                try:
+                    date_value = pd.to_datetime(
+                        date_value
+                    ).date()
+                except:
+                    date_value = None
+            elif hasattr(date_value, "date") and not isinstance(date_value, date):
+                try:
+                    date_value = date_value.date()
+                except:
+                    pass
+
+            code_value = parse_gl_code(
+                row.get("A/C Code")
             )
-        },
-        disabled=['Description'],
-        key=editor_key
+
+            st.session_state[f"{key_prefix}_date_{i}"] = date_value
+            st.session_state[f"{key_prefix}_gl_{i}"] = code_value
+            st.session_state[f"{key_prefix}_dr_{i}"] = float(
+                pd.to_numeric(
+                    row.get("Dr", 0),
+                    errors="coerce"
+                )
+                if pd.notna(row.get("Dr", 0))
+                else 0
+            )
+            st.session_state[f"{key_prefix}_cr_{i}"] = float(
+                pd.to_numeric(
+                    row.get("Cr", 0),
+                    errors="coerce"
+                )
+                if pd.notna(row.get("Cr", 0))
+                else 0
+            )
+
+        st.session_state[initialized_key] = True
+
+    row_count = st.session_state.get(
+        row_count_key,
+        2
     )
 
-    enriched = auto_fill_gl_descriptions(edited)
+    gl_options = [
+        ""
+    ] + get_gl_code_options(
+        include_inactive=include_inactive
+    )
 
-    previous_descriptions = edited['Description'].fillna('').astype(str).tolist()
-    new_descriptions = enriched['Description'].fillna('').astype(str).tolist()
+    gl_map = get_gl_description_map()
 
-    st.session_state[data_key] = enriched
+    # Column headings
+    h1, h2, h3, h4, h5 = st.columns(
+        [1.4, 1.7, 3.2, 1.2, 1.2]
+    )
 
-    if previous_descriptions != new_descriptions:
-        st.session_state[version_key] += 1
-        st.rerun()
+    h1.markdown("**Date**")
+    h2.markdown("**A/C Code**")
+    h3.markdown("**Description**")
+    h4.markdown("**Dr**")
+    h5.markdown("**Cr**")
 
-    return enriched
+    rows = []
+
+    for i in range(row_count):
+
+        c1, c2, c3, c4, c5 = st.columns(
+            [1.4, 1.7, 3.2, 1.2, 1.2]
+        )
+
+        with c1:
+            line_date = st.date_input(
+                "Date",
+                value=st.session_state.get(
+                    f"{key_prefix}_date_{i}"
+                ),
+                key=f"{key_prefix}_date_{i}",
+                label_visibility="collapsed"
+            )
+
+        current_code = st.session_state.get(
+            f"{key_prefix}_gl_{i}",
+            ""
+        )
+
+        # If an old/inactive value is not in the normal list,
+        # keep it visible for historical amendment screens.
+        row_gl_options = list(gl_options)
+
+        if current_code and current_code not in row_gl_options:
+            row_gl_options.append(
+                current_code
+            )
+
+        with c2:
+            selected_code = st.selectbox(
+                "A/C Code",
+                row_gl_options,
+                key=f"{key_prefix}_gl_{i}",
+                label_visibility="collapsed"
+            )
+
+        clean_code = parse_gl_code(
+            selected_code
+        )
+
+        description = gl_map.get(
+            clean_code,
+            ""
+        )
+
+        with c3:
+            # Read-only display rather than a widget so it updates
+            # immediately whenever A/C Code changes.
+            st.markdown(
+                description if description else "&nbsp;",
+                unsafe_allow_html=True
+            )
+
+        with c4:
+            debit = st.number_input(
+                "Dr",
+                min_value=0.00,
+                value=float(
+                    st.session_state.get(
+                        f"{key_prefix}_dr_{i}",
+                        0.00
+                    )
+                ),
+                step=0.01,
+                format="%.2f",
+                key=f"{key_prefix}_dr_{i}",
+                label_visibility="collapsed"
+            )
+
+        with c5:
+            credit = st.number_input(
+                "Cr",
+                min_value=0.00,
+                value=float(
+                    st.session_state.get(
+                        f"{key_prefix}_cr_{i}",
+                        0.00
+                    )
+                ),
+                step=0.01,
+                format="%.2f",
+                key=f"{key_prefix}_cr_{i}",
+                label_visibility="collapsed"
+            )
+
+        rows.append({
+            "Date": line_date,
+            "A/C Code": clean_code if clean_code else None,
+            "Description": description,
+            "Dr": debit,
+            "Cr": credit
+        })
+
+    b1, b2, _ = st.columns(
+        [1, 1, 4]
+    )
+
+    with b1:
+        if st.button(
+            "＋ Add Line",
+            key=f"{key_prefix}_add_line",
+            use_container_width=True
+        ):
+            new_index = row_count
+
+            st.session_state[
+                f"{key_prefix}_date_{new_index}"
+            ] = None
+
+            st.session_state[
+                f"{key_prefix}_gl_{new_index}"
+            ] = ""
+
+            st.session_state[
+                f"{key_prefix}_dr_{new_index}"
+            ] = 0.00
+
+            st.session_state[
+                f"{key_prefix}_cr_{new_index}"
+            ] = 0.00
+
+            st.session_state[row_count_key] = (
+                row_count + 1
+            )
+
+            st.rerun()
+
+    with b2:
+        if st.button(
+            "− Remove Last Line",
+            key=f"{key_prefix}_remove_line",
+            use_container_width=True,
+            disabled=row_count <= 2
+        ):
+            last_index = row_count - 1
+
+            for field in [
+                "date",
+                "gl",
+                "dr",
+                "cr"
+            ]:
+                key = (
+                    f"{key_prefix}_{field}_{last_index}"
+                )
+
+                if key in st.session_state:
+                    del st.session_state[key]
+
+            st.session_state[row_count_key] = (
+                row_count - 1
+            )
+
+            st.rerun()
+
+    return pd.DataFrame(
+        rows,
+        columns=[
+            "Date",
+            "A/C Code",
+            "Description",
+            "Dr",
+            "Cr"
+        ]
+    )
 
 
 def clear_journal_editor_state(key_prefix):
-    for suffix in ('_data', '_version'):
-        key = f'{key_prefix}{suffix}'
-        if key in st.session_state:
-            del st.session_state[key]
+    """Remove all row-based editor state so a fresh JV starts clean."""
+    keys_to_delete = [
+        key
+        for key in list(st.session_state.keys())
+        if key.startswith(
+            f"{key_prefix}_"
+        )
+    ]
+
+    for key in keys_to_delete:
+        del st.session_state[key]
+
 
 
 def get_last_jv_remarks(accounting_period, employee_no):
