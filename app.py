@@ -1026,285 +1026,203 @@ def auto_fill_gl_descriptions(df):
     return result
 
 
+def normalize_journal_editor_df(df):
+    """Return a clean dataframe compatible with Streamlit data_editor."""
+    if not isinstance(df, pd.DataFrame):
+        df = pd.DataFrame()
+
+    result = df.copy()
+
+    required = [
+        "Date",
+        "A/C Code",
+        "Description",
+        "Dr",
+        "Cr"
+    ]
+
+    for col in required:
+        if col not in result.columns:
+            if col in ["Dr", "Cr"]:
+                result[col] = 0.00
+            else:
+                result[col] = None if col in ["Date", "A/C Code"] else ""
+
+    result = result[required].copy()
+
+    result["A/C Code"] = result["A/C Code"].apply(
+        lambda x: parse_gl_code(x) if pd.notna(x) else None
+    )
+
+    result["Description"] = (
+        result["Description"]
+        .fillna("")
+        .astype(str)
+    )
+
+    result["Dr"] = pd.to_numeric(
+        result["Dr"],
+        errors="coerce"
+    ).fillna(0.00)
+
+    result["Cr"] = pd.to_numeric(
+        result["Cr"],
+        errors="coerce"
+    ).fillna(0.00)
+
+    # Streamlit DateColumn behaves more reliably with date / None values.
+    def clean_date(value):
+        if value is None or pd.isna(value):
+            return None
+
+        if isinstance(value, date) and not isinstance(value, datetime):
+            return value
+
+        try:
+            return pd.to_datetime(value).date()
+        except:
+            return None
+
+    result["Date"] = result["Date"].apply(
+        clean_date
+    )
+
+    return result
+
+
 def render_auto_gl_editor(base_df, key_prefix, include_inactive=False):
     """
-    Stable row-based journal editor.
+    Grid-style journal editor.
 
     A/C Code shows code only.
-    Account Description is automatically displayed from the G/L Master.
-    This avoids mutating a Streamlit data_editor after it has been rendered.
+    Description is automatically populated from the controlled G/L Master.
     """
-    row_count_key = f"{key_prefix}_row_count"
-    initialized_key = f"{key_prefix}_initialized"
+    data_key = f"{key_prefix}_grid_data"
+    version_key = f"{key_prefix}_grid_version"
+    codes_key = f"{key_prefix}_grid_codes"
 
-    base_df = base_df.copy()
-
-    if not st.session_state.get(initialized_key, False):
-
-        row_count = max(
-            len(base_df),
-            2
+    if (
+        data_key not in st.session_state
+        or not isinstance(
+            st.session_state.get(data_key),
+            pd.DataFrame
+        )
+    ):
+        initial_df = normalize_journal_editor_df(
+            base_df
+        )
+        initial_df = auto_fill_gl_descriptions(
+            initial_df
         )
 
-        st.session_state[row_count_key] = row_count
-
-        for i in range(row_count):
-
-            if i < len(base_df):
-                row = base_df.iloc[i]
-            else:
-                row = {
-                    "Date": None,
-                    "A/C Code": None,
-                    "Description": "",
-                    "Dr": 0.00,
-                    "Cr": 0.00
-                }
-
-            date_value = row.get("Date")
-
-            if pd.isna(date_value):
-                date_value = None
-            elif isinstance(date_value, str):
-                try:
-                    date_value = pd.to_datetime(
-                        date_value
-                    ).date()
-                except:
-                    date_value = None
-            elif hasattr(date_value, "date") and not isinstance(date_value, date):
-                try:
-                    date_value = date_value.date()
-                except:
-                    pass
-
-            code_value = parse_gl_code(
-                row.get("A/C Code")
-            )
-
-            st.session_state[f"{key_prefix}_date_{i}"] = date_value
-            st.session_state[f"{key_prefix}_gl_{i}"] = code_value
-            st.session_state[f"{key_prefix}_dr_{i}"] = float(
-                pd.to_numeric(
-                    row.get("Dr", 0),
-                    errors="coerce"
-                )
-                if pd.notna(row.get("Dr", 0))
-                else 0
-            )
-            st.session_state[f"{key_prefix}_cr_{i}"] = float(
-                pd.to_numeric(
-                    row.get("Cr", 0),
-                    errors="coerce"
-                )
-                if pd.notna(row.get("Cr", 0))
-                else 0
-            )
-
-        st.session_state[initialized_key] = True
-
-    row_count = st.session_state.get(
-        row_count_key,
-        2
-    )
-
-    gl_options = [
-        ""
-    ] + get_gl_code_options(
-        include_inactive=include_inactive
-    )
-
-    gl_map = get_gl_description_map()
-
-    # Column headings
-    h1, h2, h3, h4, h5 = st.columns(
-        [1.4, 1.7, 3.2, 1.2, 1.2]
-    )
-
-    h1.markdown("**Date**")
-    h2.markdown("**A/C Code**")
-    h3.markdown("**Description**")
-    h4.markdown("**Dr**")
-    h5.markdown("**Cr**")
-
-    rows = []
-
-    for i in range(row_count):
-
-        c1, c2, c3, c4, c5 = st.columns(
-            [1.4, 1.7, 3.2, 1.2, 1.2]
+        st.session_state[data_key] = initial_df
+        st.session_state[codes_key] = (
+            initial_df["A/C Code"]
+            .fillna("")
+            .astype(str)
+            .tolist()
         )
+        st.session_state[version_key] = 0
 
-        with c1:
-            line_date = st.date_input(
+    working_df = normalize_journal_editor_df(
+        st.session_state[data_key]
+    )
+
+    # Always refresh account descriptions from the latest G/L Master.
+    working_df = auto_fill_gl_descriptions(
+        working_df
+    )
+
+    version = st.session_state.get(
+        version_key,
+        0
+    )
+
+    editor_key = (
+        f"{key_prefix}_grid_widget_{version}"
+    )
+
+    edited = st.data_editor(
+        working_df,
+        num_rows="dynamic",
+        hide_index=True,
+        use_container_width=True,
+        column_config={
+            "Date": st.column_config.DateColumn(
                 "Date",
-                value=st.session_state.get(
-                    f"{key_prefix}_date_{i}"
-                ),
-                key=f"{key_prefix}_date_{i}",
-                label_visibility="collapsed"
-            )
-
-        current_code = st.session_state.get(
-            f"{key_prefix}_gl_{i}",
-            ""
-        )
-
-        # If an old/inactive value is not in the normal list,
-        # keep it visible for historical amendment screens.
-        row_gl_options = list(gl_options)
-
-        if current_code and current_code not in row_gl_options:
-            row_gl_options.append(
-                current_code
-            )
-
-        with c2:
-            selected_code = st.selectbox(
+                format="DD/MM/YYYY"
+            ),
+            "A/C Code": st.column_config.SelectboxColumn(
                 "A/C Code",
-                row_gl_options,
-                key=f"{key_prefix}_gl_{i}",
-                label_visibility="collapsed"
-            )
-
-        clean_code = parse_gl_code(
-            selected_code
-        )
-
-        description = gl_map.get(
-            clean_code,
-            ""
-        )
-
-        with c3:
-            # Read-only display rather than a widget so it updates
-            # immediately whenever A/C Code changes.
-            st.markdown(
-                description if description else "&nbsp;",
-                unsafe_allow_html=True
-            )
-
-        with c4:
-            debit = st.number_input(
+                options=get_gl_code_options(
+                    include_inactive=include_inactive
+                )
+            ),
+            "Description": st.column_config.TextColumn(
+                "Description",
+                width="large"
+            ),
+            "Dr": st.column_config.NumberColumn(
                 "Dr",
                 min_value=0.00,
-                value=float(
-                    st.session_state.get(
-                        f"{key_prefix}_dr_{i}",
-                        0.00
-                    )
-                ),
-                step=0.01,
-                format="%.2f",
-                key=f"{key_prefix}_dr_{i}",
-                label_visibility="collapsed"
-            )
-
-        with c5:
-            credit = st.number_input(
+                format="%.2f"
+            ),
+            "Cr": st.column_config.NumberColumn(
                 "Cr",
                 min_value=0.00,
-                value=float(
-                    st.session_state.get(
-                        f"{key_prefix}_cr_{i}",
-                        0.00
-                    )
-                ),
-                step=0.01,
-                format="%.2f",
-                key=f"{key_prefix}_cr_{i}",
-                label_visibility="collapsed"
+                format="%.2f"
             )
-
-        rows.append({
-            "Date": line_date,
-            "A/C Code": clean_code if clean_code else None,
-            "Description": description,
-            "Dr": debit,
-            "Cr": credit
-        })
-
-    b1, b2, _ = st.columns(
-        [1, 1, 4]
+        },
+        disabled=["Description"],
+        key=editor_key
     )
 
-    with b1:
-        if st.button(
-            "＋ Add Line",
-            key=f"{key_prefix}_add_line",
-            use_container_width=True
-        ):
-            new_index = row_count
-
-            st.session_state[
-                f"{key_prefix}_date_{new_index}"
-            ] = None
-
-            st.session_state[
-                f"{key_prefix}_gl_{new_index}"
-            ] = ""
-
-            st.session_state[
-                f"{key_prefix}_dr_{new_index}"
-            ] = 0.00
-
-            st.session_state[
-                f"{key_prefix}_cr_{new_index}"
-            ] = 0.00
-
-            st.session_state[row_count_key] = (
-                row_count + 1
-            )
-
-            st.rerun()
-
-    with b2:
-        if st.button(
-            "− Remove Last Line",
-            key=f"{key_prefix}_remove_line",
-            use_container_width=True,
-            disabled=row_count <= 2
-        ):
-            last_index = row_count - 1
-
-            for field in [
-                "date",
-                "gl",
-                "dr",
-                "cr"
-            ]:
-                key = (
-                    f"{key_prefix}_{field}_{last_index}"
-                )
-
-                if key in st.session_state:
-                    del st.session_state[key]
-
-            st.session_state[row_count_key] = (
-                row_count - 1
-            )
-
-            st.rerun()
-
-    return pd.DataFrame(
-        rows,
-        columns=[
-            "Date",
-            "A/C Code",
-            "Description",
-            "Dr",
-            "Cr"
-        ]
+    edited = normalize_journal_editor_df(
+        edited
     )
+
+    current_codes = (
+        edited["A/C Code"]
+        .fillna("")
+        .astype(str)
+        .tolist()
+    )
+
+    previous_codes = st.session_state.get(
+        codes_key,
+        []
+    )
+
+    enriched = auto_fill_gl_descriptions(
+        edited
+    )
+
+    st.session_state[data_key] = enriched
+
+    # When user changes a G/L code, refresh the grid once so the
+    # corresponding Description appears immediately.
+    if current_codes != previous_codes:
+        st.session_state[codes_key] = current_codes
+        st.session_state[version_key] = version + 1
+        st.rerun()
+
+    st.session_state[codes_key] = current_codes
+
+    return enriched
 
 
 def clear_journal_editor_state(key_prefix):
-    """Remove all row-based editor state so a fresh JV starts clean."""
+    """Clear all state belonging to a grid journal editor."""
+    prefixes = [
+        f"{key_prefix}_grid_"
+    ]
+
     keys_to_delete = [
         key
         for key in list(st.session_state.keys())
-        if key.startswith(
-            f"{key_prefix}_"
+        if any(
+            key.startswith(prefix)
+            for prefix in prefixes
         )
     ]
 
@@ -6689,139 +6607,293 @@ elif st.session_state.page == "Search JVs":
 elif st.session_state.page == "Audit Trail":
 
     if role != "AUDITOR":
-        st.error("Access denied.")
+
+        st.error(
+            "Access denied."
+        )
+
         st.stop()
 
-    st.header("Audit Trail")
-    c1, c2, c3 = st.columns(3)
-
-    with c1:
-        audit_jv_search = st.text_input(
-            "JV Number",
-            key="audit_jv_search"
-        )
-
-    with c2:
-        audit_year = st.selectbox(
-            "Year",
-            ["ALL"] + [
-                str(year)
-                for year in range(2025, 2031)
-            ],
-            key="audit_year_filter"
-        )
-
-    with c3:
-        audit_action = st.selectbox(
-            "Action",
-            [
-                "ALL",
-                "JV_SUBMITTED",
-                "JV_APPROVED",
-                "JV_POSTED_TO_UBS"
-            ],
-            key="audit_action_filter"
-        )
-
-    audit_query = """
-        SELECT
-            a.jv_number AS "JV No.",
-            j.accounting_period AS "Period",
-            a.event_type AS "Action",
-            a.employee_no AS "Employee No.",
-            a.employee_name AS "Employee",
-            a.role AS "Role",
-            a.comments AS "Comments",
-            a.event_timestamp AS "Date / Time"
-        FROM audit_log a
-        JOIN jv_headers j
-            ON a.jv_id = j.id
-        WHERE j.status IN (
-            'APPROVED',
-            'POSTED TO UBS'
-        )
-        AND a.event_type IN (
-            'JV_SUBMITTED',
-            'JV_APPROVED',
-            'JV_POSTED_TO_UBS'
-        )
-    """
-
-    audit_params = []
-
-    if audit_jv_search.strip():
-        audit_query += """
-            AND UPPER(a.jv_number) LIKE UPPER(?)
-        """
-        audit_params.append(
-            f"%{audit_jv_search.strip()}%"
-        )
-
-    if audit_year != "ALL":
-        audit_query += """
-            AND substr(j.accounting_period, 1, 4) = ?
-        """
-        audit_params.append(audit_year)
-
-    if audit_action != "ALL":
-        audit_query += " AND a.event_type = ?"
-        audit_params.append(audit_action)
-
-    audit_query += """
-        ORDER BY j.accounting_period DESC, a.id DESC
-    """
-
-    conn = get_connection()
-
-    audit_df = pd.read_sql_query(
-        audit_query,
-        conn,
-        params=audit_params
+    st.header(
+        "Audit Trail"
     )
 
-    conn.close()
-
-    if not audit_df.empty:
-        audit_df["Period"] = audit_df["Period"].apply(
-            month_label
-        )
-        audit_df["Date / Time"] = audit_df["Date / Time"].apply(
-            display_datetime
-        )
-
-    st.subheader(
-        f"Audit Records ({len(audit_df)})"
+    st.caption(
+        "Select an accounting month to view the final Journal Vouchers."
     )
 
-    if audit_df.empty:
-        st.info(
-            "No audit records match the selected filters."
-        )
+    # -----------------------------------------------------
+    # MONTH LIST
+    # -----------------------------------------------------
+
+    if st.session_state.audit_month is None:
+
+        conn = get_connection()
+
+        month_rows = conn.execute("""
+            SELECT
+                accounting_period,
+                COUNT(*) AS jv_count
+            FROM jv_headers
+            WHERE status IN (
+                'APPROVED',
+                'POSTED TO UBS'
+            )
+            GROUP BY accounting_period
+            ORDER BY accounting_period DESC
+        """).fetchall()
+
+        conn.close()
+
+        if not month_rows:
+
+            st.info(
+                "No final JV records are available."
+            )
+
+        else:
+
+            st.subheader(
+                "Accounting Months"
+            )
+
+            for accounting_period, jv_count in month_rows:
+
+                c1, c2, c3 = st.columns(
+                    [4, 1, 1]
+                )
+
+                with c1:
+
+                    st.write(
+                        f"**{month_label(accounting_period)}**"
+                    )
+
+                with c2:
+
+                    st.caption(
+                        f"{jv_count} JV"
+                        f"{'s' if jv_count != 1 else ''}"
+                    )
+
+                with c3:
+
+                    if st.button(
+                        "Open",
+                        key=f"audit_open_month_{accounting_period}",
+                        use_container_width=True
+                    ):
+
+                        st.session_state.audit_month = (
+                            accounting_period
+                        )
+
+                        st.rerun()
+
+                st.divider()
+
+    # -----------------------------------------------------
+    # JV LIST FOR SELECTED MONTH
+    # -----------------------------------------------------
+
     else:
-        st.dataframe(
-            audit_df,
-            use_container_width=True,
-            hide_index=True
+
+        selected_month = st.session_state.audit_month
+
+        if st.button(
+            "← Back to Months",
+            key="audit_back_to_months"
+        ):
+
+            st.session_state.audit_month = None
+            st.rerun()
+
+        st.subheader(
+            month_label(selected_month)
         )
 
+        f1, f2 = st.columns(2)
 
-# =========================================================
-# NOTIFICATIONS
-# =========================================================
+        with f1:
 
-elif st.session_state.page == "Notifications":
+            audit_jv_search = st.text_input(
+                "JV Number",
+                key="audit_jv_search",
+                placeholder="e.g. JV260901"
+            )
 
-    # Legacy safety redirect. Notifications are now surfaced as actionable
-    # counts in My JVs / Approval Inbox instead of a separate inbox.
-    if role == "PREPARER":
-        request_navigation("My JVs")
+        with f2:
 
-    elif role == "APPROVER":
-        request_navigation("Approval Inbox")
+            audit_status = st.selectbox(
+                "Status",
+                [
+                    "ALL",
+                    "APPROVED",
+                    "POSTED TO UBS"
+                ],
+                key="audit_status_filter"
+            )
 
-    else:
-        request_navigation("Dashboard")
+        query = """
+            SELECT
+                j.jv_number,
+                COALESCE(j.remarks, ''),
+                j.prepared_name,
+                j.prepared_by,
+                j.submitted_at,
+                COALESCE(j.approved_name, ''),
+                COALESCE(j.approved_by, ''),
+                j.approved_at,
+                j.status
+            FROM jv_headers j
+            WHERE j.accounting_period = ?
+            AND j.status IN (
+                'APPROVED',
+                'POSTED TO UBS'
+            )
+        """
 
+        params = [
+            selected_month
+        ]
+
+        if audit_jv_search.strip():
+
+            query += """
+                AND UPPER(j.jv_number) LIKE UPPER(?)
+            """
+
+            params.append(
+                f"%{audit_jv_search.strip()}%"
+            )
+
+        if audit_status != "ALL":
+
+            query += """
+                AND j.status = ?
+            """
+
+            params.append(
+                audit_status
+            )
+
+        query += """
+            ORDER BY j.jv_number ASC
+        """
+
+        conn = get_connection()
+
+        rows = conn.execute(
+            query,
+            params
+        ).fetchall()
+
+        conn.close()
+
+        st.subheader(
+            f"Final JV Records ({len(rows)})"
+        )
+
+        if not rows:
+
+            st.info(
+                "No final JV records match the selected filters."
+            )
+
+        else:
+
+            for row in rows:
+
+                (
+                    jv_number,
+                    remarks,
+                    prepared_name,
+                    prepared_by,
+                    submitted_at,
+                    approved_name,
+                    approved_by,
+                    approved_at,
+                    status
+                ) = row
+
+                c1, c2, c3, c4 = st.columns(
+                    [2, 4, 2, 1]
+                )
+
+                with c1:
+
+                    st.write(
+                        f"**{jv_number}**"
+                    )
+
+                    st.caption(
+                        status
+                    )
+
+                with c2:
+
+                    st.write(
+                        remarks if remarks else "-"
+                    )
+
+                    st.caption(
+                        f"Prepared by: "
+                        f"{prepared_name} ({prepared_by})"
+                    )
+
+                with c3:
+
+                    if approved_name:
+
+                        st.write(
+                            f"Approved by: {approved_name}"
+                        )
+
+                        st.caption(
+                            display_datetime(
+                                approved_at
+                            )
+                        )
+
+                    else:
+
+                        st.write(
+                            "-"
+                        )
+
+                with c4:
+
+                    # Auditor goes to the existing read-only Search JVs detail.
+                    if st.button(
+                        "Open",
+                        key=f"audit_open_jv_{jv_number}",
+                        use_container_width=True
+                    ):
+
+                        conn = get_connection()
+
+                        jv_id_row = conn.execute("""
+                            SELECT id
+                            FROM jv_headers
+                            WHERE jv_number = ?
+                            LIMIT 1
+                        """, (
+                            jv_number,
+                        )).fetchone()
+
+                        conn.close()
+
+                        if jv_id_row:
+
+                            st.session_state.search_jv_id = (
+                                jv_id_row[0]
+                            )
+
+                            request_navigation(
+                                "Search JVs"
+                            )
+
+                st.divider()
 
 # =========================================================
 # NEW PIC REQUEST
@@ -8032,12 +8104,49 @@ elif st.session_state.page == "G/L Master":
                 st.error(f"Unable to read the Excel file: {exc}")
 
         if "gl_import_result" in st.session_state:
-            result = st.session_state.gl_import_result
-            st.success("G/L Master import completed successfully.")
-            r1, r2, r3 = st.columns(3)
-            r1.metric("Created", result.get("created", 0))
-            r2.metric("Updated", result.get("updated", 0))
-            r3.metric("Skipped", result.get("skipped", 0))
+
+            import_result = st.session_state.get(
+                "gl_import_result"
+            )
+
+            # Clear stale values left in browser session state by
+            # previous app versions instead of crashing the whole G/L page.
+            if not isinstance(import_result, dict):
+                st.session_state.pop(
+                    "gl_import_result",
+                    None
+                )
+
+            else:
+                st.success(
+                    "G/L Master import completed successfully."
+                )
+
+                r1, r2, r3 = st.columns(3)
+
+                r1.metric(
+                    "Created",
+                    import_result.get(
+                        "created",
+                        0
+                    )
+                )
+
+                r2.metric(
+                    "Updated",
+                    import_result.get(
+                        "updated",
+                        0
+                    )
+                )
+
+                r3.metric(
+                    "Skipped",
+                    import_result.get(
+                        "skipped",
+                        0
+                    )
+                )
 
 
     # -----------------------------------------------------
