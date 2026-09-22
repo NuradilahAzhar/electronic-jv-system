@@ -1092,14 +1092,17 @@ def normalize_journal_editor_df(df):
 
 def render_auto_gl_editor(base_df, key_prefix, include_inactive=False):
     """
-    Grid-style journal editor.
+    Stable grid-style journal editor.
 
-    A/C Code shows code only.
-    Description is automatically populated from the controlled G/L Master.
+    Important:
+    - No forced rerun when A/C Code changes.
+    - User can search the dropdown by account code or account name.
+    - Journal data returned to the system is always normalised to code only.
+    - Description is controlled by the G/L Master.
     """
     data_key = f"{key_prefix}_grid_data"
-    version_key = f"{key_prefix}_grid_version"
     codes_key = f"{key_prefix}_grid_codes"
+    editor_key = f"{key_prefix}_grid_widget"
 
     if (
         data_key not in st.session_state
@@ -1111,36 +1114,60 @@ def render_auto_gl_editor(base_df, key_prefix, include_inactive=False):
         initial_df = normalize_journal_editor_df(
             base_df
         )
+
         initial_df = auto_fill_gl_descriptions(
             initial_df
         )
 
         st.session_state[data_key] = initial_df
+
         st.session_state[codes_key] = (
             initial_df["A/C Code"]
             .fillna("")
             .astype(str)
             .tolist()
         )
-        st.session_state[version_key] = 0
 
     working_df = normalize_journal_editor_df(
         st.session_state[data_key]
     )
 
-    # Always refresh account descriptions from the latest G/L Master.
     working_df = auto_fill_gl_descriptions(
         working_df
     )
 
-    version = st.session_state.get(
-        version_key,
-        0
-    )
+    gl_map = get_gl_description_map()
 
-    editor_key = (
-        f"{key_prefix}_grid_widget_{version}"
-    )
+    searchable_options = []
+
+    # Keep any current codes valid in the dropdown.
+    for value in (
+        working_df["A/C Code"]
+        .dropna()
+        .astype(str)
+        .tolist()
+    ):
+        code = parse_gl_code(value)
+
+        if code and code not in searchable_options:
+            searchable_options.append(code)
+
+    # Add searchable labels: CODE - ACCOUNT NAME
+    for code, description in gl_map.items():
+
+        if (
+            include_inactive
+            or gl_is_active(code)
+        ):
+
+            label = (
+                f"{code} - {description}"
+                if description
+                else code
+            )
+
+            if label not in searchable_options:
+                searchable_options.append(label)
 
     edited = st.data_editor(
         working_df,
@@ -1154,26 +1181,11 @@ def render_auto_gl_editor(base_df, key_prefix, include_inactive=False):
             ),
             "A/C Code": st.column_config.SelectboxColumn(
                 "A/C Code",
-                # Search by either account code or account name.
-                # After selection the journal stores/displays code only.
-                options=list(dict.fromkeys(
-                    [
-                        parse_gl_code(v)
-                        for v in working_df["A/C Code"]
-                        .dropna()
-                        .astype(str)
-                        .tolist()
-                        if parse_gl_code(v)
-                    ]
-                    + [
-                        f"{code} - {description}"
-                        for code, description in get_gl_description_map().items()
-                        if (
-                            include_inactive
-                            or gl_is_active(code)
-                        )
-                    ]
-                ))
+                options=searchable_options,
+                help=(
+                    "Type either the account code or account name "
+                    "to search."
+                )
             ),
             "Description": st.column_config.TextColumn(
                 "Description",
@@ -1198,62 +1210,45 @@ def render_auto_gl_editor(base_df, key_prefix, include_inactive=False):
         edited
     )
 
-    # Dropdown search result may be "code - account name".
-    # Convert it back to the actual account code immediately.
+    # Normalise selected "CODE - NAME" to CODE for all business logic / saving.
     edited["A/C Code"] = edited["A/C Code"].apply(
-        lambda value: parse_gl_code(value)
-        if pd.notna(value) and str(value).strip()
-        else ""
-    )
-
-    current_codes = (
-        edited["A/C Code"]
-        .fillna("")
-        .astype(str)
-        .tolist()
-    )
-
-    previous_codes = st.session_state.get(
-        codes_key,
-        []
+        lambda value: (
+            parse_gl_code(value)
+            if pd.notna(value)
+            and str(value).strip()
+            else ""
+        )
     )
 
     enriched = auto_fill_gl_descriptions(
         edited
     )
 
+    # Persist the complete current grid without rebuilding the widget.
     st.session_state[data_key] = enriched
 
-    # When user changes a G/L code, refresh the grid once so the
-    # corresponding Description appears immediately.
-    if current_codes != previous_codes:
-        st.session_state[codes_key] = current_codes
-        st.session_state[version_key] = version + 1
-        st.rerun()
-
-    st.session_state[codes_key] = current_codes
+    st.session_state[codes_key] = (
+        enriched["A/C Code"]
+        .fillna("")
+        .astype(str)
+        .tolist()
+    )
 
     return enriched
 
 
 def clear_journal_editor_state(key_prefix):
-    """Clear all state belonging to a grid journal editor."""
-    prefixes = [
-        f"{key_prefix}_grid_"
-    ]
-
+    """Clear all state belonging to a journal editor."""
     keys_to_delete = [
         key
         for key in list(st.session_state.keys())
-        if any(
-            key.startswith(prefix)
-            for prefix in prefixes
+        if key.startswith(
+            f"{key_prefix}_grid_"
         )
     ]
 
     for key in keys_to_delete:
         del st.session_state[key]
-
 
 
 def get_last_jv_remarks(accounting_period, employee_no):
