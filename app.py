@@ -1154,9 +1154,21 @@ def render_auto_gl_editor(base_df, key_prefix, include_inactive=False):
             ),
             "A/C Code": st.column_config.SelectboxColumn(
                 "A/C Code",
-                options=get_gl_code_options(
-                    include_inactive=include_inactive
-                )
+                # Search by either account code or account name.
+                # After selection the journal stores/displays code only.
+                options=list(dict.fromkeys(
+                    [
+                        parse_gl_code(v)
+                        for v in working_df["A/C Code"]
+                        .dropna()
+                        .astype(str)
+                        .tolist()
+                        if parse_gl_code(v)
+                    ]
+                    + get_gl_dropdown_options(
+                        include_inactive=include_inactive
+                    )
+                ))
             ),
             "Description": st.column_config.TextColumn(
                 "Description",
@@ -1179,6 +1191,14 @@ def render_auto_gl_editor(base_df, key_prefix, include_inactive=False):
 
     edited = normalize_journal_editor_df(
         edited
+    )
+
+    # Dropdown search result may be "code - account name".
+    # Convert it back to the actual account code immediately.
+    edited["A/C Code"] = edited["A/C Code"].apply(
+        lambda value: parse_gl_code(value)
+        if pd.notna(value) and str(value).strip()
+        else ""
     )
 
     current_codes = (
