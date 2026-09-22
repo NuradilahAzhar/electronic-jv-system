@@ -1165,9 +1165,14 @@ def render_auto_gl_editor(base_df, key_prefix, include_inactive=False):
                         .tolist()
                         if parse_gl_code(v)
                     ]
-                    + get_gl_dropdown_options(
-                        include_inactive=include_inactive
-                    )
+                    + [
+                        f"{code} - {description}"
+                        for code, description in get_gl_description_map().items()
+                        if (
+                            include_inactive
+                            or gl_is_active(code)
+                        )
+                    ]
                 ))
             ),
             "Description": st.column_config.TextColumn(
